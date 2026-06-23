@@ -15,7 +15,7 @@ export default function DashboardLayout({
         <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
           <Header />
           {/* Shared premium backdrop for all dashboard pages (rendered once here). */}
-          <main className="relative flex-1 overflow-hidden flex flex-col">
+          <main className="relative isolate flex-1 overflow-hidden flex flex-col">
             <DashboardBackground />
             {children}
           </main>

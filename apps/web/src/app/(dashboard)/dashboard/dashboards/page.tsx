@@ -123,9 +123,9 @@ export default function DashboardsListPage() {
             </button>
           </div>
         ) : (
-          <div className={cn('grid gap-4', view === 'grid' ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-1')}>
+          <div className={cn('grid gap-4', view === 'grid' ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-1 gap-2.5')}>
             {filtered.map((d, i) => (
-              <DashboardCard key={d.id} dashboard={d} index={i} />
+              <DashboardCard key={d.id} dashboard={d} index={i} view={view} />
             ))}
           </div>
         )}

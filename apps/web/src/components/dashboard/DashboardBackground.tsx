@@ -7,7 +7,7 @@ import { motion } from 'framer-motion';
  *  kept low-contrast so it never hurts readability. */
 export function DashboardBackground() {
   return (
-    <div className="pointer-events-none absolute inset-0 overflow-hidden">
+    <div className="pointer-events-none absolute inset-0 -z-10 overflow-hidden">
       {/* soft top wash */}
       <div className="absolute inset-x-0 top-0 h-[420px] bg-gradient-to-b from-primary/[0.06] via-primary/[0.02] to-transparent" />
 

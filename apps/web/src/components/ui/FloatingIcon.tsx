@@ -22,23 +22,32 @@ const sizeMap = {
 export function FloatingIcon({ icon: Icon, className, delay = 0, size = 'md' }: Props) {
   const s = sizeMap[size];
   return (
+    // Outer wrapper handles the entrance (fade/scale in together with the rest of
+    // the hero); the inner element runs the perpetual float loop. Keeping them
+    // separate lets the icons animate in instead of popping in at full opacity.
     <motion.div
       aria-hidden
       className={cn('absolute z-10', className)}
-      animate={{ y: [0, -16, 0], rotate: [-3, 3, -3] }}
-      transition={{ duration: 6 + delay, repeat: Infinity, ease: 'easeInOut', delay }}
+      initial={{ opacity: 0, scale: 0.8 }}
+      animate={{ opacity: 1, scale: 1 }}
+      transition={{ duration: 0.6, delay: 0.25, ease: 'easeOut' }}
     >
-      <div
-        className={cn(
-          'flex items-center justify-center border border-white/70 bg-white/40 shadow-[0_8px_30px_rgba(91,79,247,0.18)] backdrop-blur-xl',
-          'relative overflow-hidden',
-          s.box,
-        )}
+      <motion.div
+        animate={{ y: [0, -16, 0], rotate: [-3, 3, -3] }}
+        transition={{ duration: 6 + delay, repeat: Infinity, ease: 'easeInOut', delay }}
       >
-        {/* inner glow */}
-        <div className="absolute inset-0 bg-gradient-to-br from-white/60 to-transparent" />
-        <Icon className={cn('relative text-[#5B4FF7]', s.icon)} strokeWidth={2} />
-      </div>
+        <div
+          className={cn(
+            'flex items-center justify-center border border-white/70 bg-white/40 shadow-[0_8px_30px_rgba(91,79,247,0.18)] backdrop-blur-xl',
+            'relative overflow-hidden',
+            s.box,
+          )}
+        >
+          {/* inner glow */}
+          <div className="absolute inset-0 bg-gradient-to-br from-white/60 to-transparent" />
+          <Icon className={cn('relative text-[#5B4FF7]', s.icon)} strokeWidth={2} />
+        </div>
+      </motion.div>
     </motion.div>
   );
 }
