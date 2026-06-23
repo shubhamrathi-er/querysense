@@ -7,6 +7,7 @@ import { GroqProvider } from './providers/groq.provider';
 import { GeminiProvider } from './providers/gemini.provider';
 import { OpenRouterProvider } from './providers/openrouter.provider';
 import { SqlValidatorService } from './sql-validator.service';
+import type { DbEngine } from '../common/db/engine';
 import {
   buildSQLGenerationPrompt,
   buildInsightPrompt,
@@ -388,6 +389,7 @@ export class AiOrchestratorService {
    */
   async reviewSchema(
     schemaSummary: string,
+    engine: DbEngine = 'mysql',
   ): Promise<
     Array<{
       severity: 'high' | 'medium' | 'low' | 'info';
@@ -397,11 +399,12 @@ export class AiOrchestratorService {
       recommendation: string;
     }>
   > {
+    const dialect = engine === 'postgres' ? 'PostgreSQL' : 'MySQL';
     const messages: ChatMessage[] = [
       {
         role: 'system',
         content:
-          'You are a senior database architect reviewing a MySQL schema. Identify up to 8 ' +
+          `You are a senior database architect reviewing a ${dialect} schema. Identify up to 8 ` +
           'higher-level best-practice issues or design smells (normalization, missing ' +
           'relationships, redundant data, scalability, audit columns, etc.). Be specific and ' +
           'actionable. Respond with ONLY a JSON array — no prose, no markdown fences.\n' +

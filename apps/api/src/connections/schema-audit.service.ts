@@ -94,7 +94,7 @@ export class SchemaAuditService {
 
     // AI advisor — best-effort, adds higher-level suggestions.
     try {
-      const advice = await this.ai.reviewSchema(this.schemaSummary(tables));
+      const advice = await this.ai.reviewSchema(this.schemaSummary(tables), engine);
       advice.forEach((a, i) =>
         findings.push({
           id: `ai:${i}`,

@@ -10,6 +10,7 @@ import { Select } from '@/components/ui/select';
 import { useConfirm } from '@/components/ui/confirm';
 import { useToast } from '@/components/ui/toast';
 import { useConnections } from '@/features/connections/hooks/useConnections';
+import type { DatabaseEngine } from '@/features/connections/types';
 import { useWorkspaceStore } from '@/stores/workspace.store';
 import {
   usePlanMigration,
@@ -43,6 +44,20 @@ export function MigrationWizard({ onClose }: Props) {
   const [step, setStep] = useState<Step>('select');
   const [sourceId, setSourceId] = useState('');
   const [targetId, setTargetId] = useState('');
+
+  // Migration is same-engine only. Constrain the pickers so a MySQL↔PostgreSQL
+  // pair can't even be selected (the API would reject it anyway).
+  const engineOf = (id: string) => active.find((c) => c.id === id)?.engine;
+  const sourceEngine = engineOf(sourceId);
+  const targetEngine = engineOf(targetId);
+  const selectSource = (id: string) => {
+    setSourceId(id);
+    if (targetId && engineOf(targetId) !== engineOf(id)) setTargetId('');
+  };
+  const selectTarget = (id: string) => {
+    setTargetId(id);
+    if (sourceId && engineOf(sourceId) !== engineOf(id)) setSourceId('');
+  };
 
   const plan = usePlanMigration();
   const script = useGenerateScript();
@@ -213,7 +228,13 @@ export function MigrationWizard({ onClose }: Props) {
           <div className="flex items-center gap-2">
             <Database className="w-5 h-5 text-primary" />
             <h2 className="font-semibold">Migrate data</h2>
-            <span className="text-xs text-muted-foreground">MySQL → MySQL</span>
+            <span className="text-xs text-muted-foreground">
+              {(() => {
+                const e = sourceEngine ?? targetEngine;
+                const name = e === 'postgres' ? 'PostgreSQL' : e === 'mysql' ? 'MySQL' : null;
+                return name ? `${name} → ${name}` : 'Same-engine copy';
+              })()}
+            </span>
           </div>
           <button
             onClick={() => {
@@ -232,11 +253,15 @@ export function MigrationWizard({ onClose }: Props) {
               <p className="text-sm text-muted-foreground">
                 Copy tables and data from one connection to another.
               </p>
-              <ConnSelect label="Source" value={sourceId} onChange={setSourceId} options={active} exclude={targetId} />
+              <ConnSelect label="Source" value={sourceId} onChange={selectSource} options={active} exclude={targetId} engineFilter={targetEngine} />
               <div className="flex justify-center text-muted-foreground">
                 <ArrowRight className="w-4 h-4 rotate-90" />
               </div>
-              <ConnSelect label="Target" value={targetId} onChange={setTargetId} options={active} exclude={sourceId} />
+              <ConnSelect label="Target" value={targetId} onChange={selectTarget} options={active} exclude={sourceId} engineFilter={sourceEngine} />
+              <p className="text-[11px] text-muted-foreground">
+                Source and target must use the same database engine — cross-engine
+                migration (MySQL ↔ PostgreSQL) isn&apos;t supported.
+              </p>
               {plan.isError && (
                 <p className="text-xs text-destructive">
                   {errMsg(plan.error)}
@@ -523,13 +548,14 @@ export function MigrationWizard({ onClose }: Props) {
 }
 
 function ConnSelect({
-  label, value, onChange, options, exclude,
+  label, value, onChange, options, exclude, engineFilter,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
-  options: Array<{ id: string; name: string; databaseName: string }>;
+  options: Array<{ id: string; name: string; databaseName: string; engine: DatabaseEngine }>;
   exclude: string;
+  engineFilter?: DatabaseEngine;
 }) {
   return (
     <label className="block space-y-1">
@@ -540,6 +566,7 @@ function ConnSelect({
         placeholder="Select a connection…"
         options={options
           .filter((o) => o.id !== exclude)
+          .filter((o) => !engineFilter || o.engine === engineFilter)
           .map((o) => ({ value: o.id, label: `${o.name} (${o.databaseName})` }))}
         ariaLabel={label}
         className="w-full"

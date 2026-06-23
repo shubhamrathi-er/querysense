@@ -13,6 +13,7 @@ import {
   applyRowFilter,
   describeFilter,
   NEW_TABLE_TYPES,
+  NEW_TABLE_TYPE_LABELS,
   type ParsedCsv,
   type NewTableType,
   type FilterSpec,
@@ -696,7 +697,7 @@ function ExistingStep({
                             },
                           }))
                         }
-                        options={NEW_TABLE_TYPES.map((t) => ({ value: t, label: t }))}
+                        options={NEW_TABLE_TYPES.map((t) => ({ value: t, label: NEW_TABLE_TYPE_LABELS[t] }))}
                         ariaLabel="Column type"
                         className="px-2 py-1.5 text-xs"
                       />
@@ -885,7 +886,7 @@ function NewStep({
                 <Select
                   value={col.dbType}
                   onValueChange={(v) => updateCol(idx, { dbType: v as NewTableType })}
-                  options={NEW_TABLE_TYPES.map((t) => ({ value: t, label: t }))}
+                  options={NEW_TABLE_TYPES.map((t) => ({ value: t, label: NEW_TABLE_TYPE_LABELS[t] }))}
                   ariaLabel="Column type"
                   className="px-2 py-1.5 text-xs"
                 />

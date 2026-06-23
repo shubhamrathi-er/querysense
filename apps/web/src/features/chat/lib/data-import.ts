@@ -7,7 +7,11 @@ export interface ParsedCsv {
   rows: Record<string, string | null>[];
 }
 
-/** MySQL types the backend accepts when creating a new table. */
+/**
+ * Canonical column types the backend accepts when creating a new table. These
+ * are engine-agnostic tokens: the API maps them to the target engine's real
+ * type (e.g. DOUBLE→DOUBLE PRECISION, DATETIME→TIMESTAMP on PostgreSQL).
+ */
 export const NEW_TABLE_TYPES = [
   'INT',
   'BIGINT',
@@ -21,6 +25,19 @@ export const NEW_TABLE_TYPES = [
 ] as const;
 
 export type NewTableType = (typeof NEW_TABLE_TYPES)[number];
+
+/** Human-friendly labels for the type picker (values stay canonical). */
+export const NEW_TABLE_TYPE_LABELS: Record<NewTableType, string> = {
+  INT: 'Whole number',
+  BIGINT: 'Whole number (large)',
+  DOUBLE: 'Decimal (approximate)',
+  'DECIMAL(18,4)': 'Decimal (exact)',
+  'VARCHAR(255)': 'Text (short)',
+  TEXT: 'Text (long)',
+  DATE: 'Date',
+  DATETIME: 'Date & time',
+  BOOLEAN: 'Yes / No',
+};
 
 const DELIMITER_CANDIDATES = [',', '\t', ';', '|'];
 
