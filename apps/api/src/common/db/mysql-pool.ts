@@ -2,6 +2,7 @@ import * as mysql from 'mysql2/promise';
 import { Pool as PgPool } from 'pg';
 import * as mssql from 'mssql';
 import * as snowflake from 'snowflake-sdk';
+import * as oracledb from 'oracledb';
 import * as net from 'net';
 import { Client } from 'ssh2';
 import { DbEngine } from './engine';
@@ -270,6 +271,48 @@ export async function createSqlServerPool(
   return { pool, cleanup };
 }
 
+export interface TunneledOraclePool {
+  pool: oracledb.Pool;
+  cleanup: () => Promise<void>;
+}
+
+/**
+ * Create an Oracle pool (node-oracledb thin mode — no Instant Client needed),
+ * tunnelling through SSH when configured. connectString is host:port/service.
+ */
+export async function createOraclePool(
+  cfg: PoolConfig,
+): Promise<TunneledOraclePool> {
+  let tunnel: { host: string; port: number; close: () => Promise<void> } | null =
+    null;
+  let host = cfg.host;
+  let port = cfg.port;
+  if (cfg.ssh) {
+    tunnel = await openSshTunnel(cfg.ssh, cfg.host, cfg.port);
+    host = tunnel.host;
+    port = tunnel.port;
+  }
+  const pool = await oracledb.createPool({
+    user: cfg.user,
+    password: cfg.password,
+    connectString: `${host}:${port}/${cfg.database}`,
+    poolMin: 0,
+    poolMax: cfg.connectionLimit ?? 3,
+    poolTimeout: 60,
+  });
+
+  const cleanup = async () => {
+    try {
+      await pool.close(0);
+    } catch {
+      /* ignore */
+    }
+    if (tunnel) await tunnel.close();
+  };
+
+  return { pool, cleanup };
+}
+
 export interface SnowflakeHandle {
   execute<T = Record<string, unknown>>(
     sqlText: string,
@@ -482,6 +525,95 @@ export async function createPool(
           throw err;
         } finally {
           client.release();
+        }
+      },
+    };
+  }
+
+  if (engine === 'oracle') {
+    const { pool, cleanup } = await createOraclePool(cfg);
+    // Fetch LOBs as scalar string/buffer so rows are JSON-serialisable.
+    const fetchTypeHandler = (meta: { dbType?: unknown }) => {
+      if (meta.dbType === oracledb.DB_TYPE_CLOB) return { type: oracledb.STRING };
+      if (meta.dbType === oracledb.DB_TYPE_BLOB) return { type: oracledb.BUFFER };
+      return undefined;
+    };
+    const baseOpts = { outFormat: oracledb.OUT_FORMAT_OBJECT, fetchTypeHandler };
+    // Standalone statements autocommit (Oracle rolls back uncommitted work when a
+    // connection is returned to the pool); transaction statements must not.
+    const autoOpts = { ...baseOpts, autoCommit: true } as oracledb.ExecuteOptions;
+    const txOpts = baseOpts as oracledb.ExecuteOptions;
+    const insertSql = (table: string, columns: string[]) =>
+      `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${columns
+        .map((_, i) => `:${i + 1}`)
+        .join(', ')})`;
+    const run = async <T>(sql: string, params: unknown[] = []) => {
+      const conn = await pool.getConnection();
+      try {
+        const r = await conn.execute(
+          sql,
+          params as oracledb.BindParameters,
+          autoOpts,
+        );
+        return (r.rows ?? []) as T[];
+      } finally {
+        await conn.close();
+      }
+    };
+    return {
+      engine,
+      query: run,
+      bulkInsert: async (table, columns, rows) => {
+        if (rows.length === 0) return 0;
+        const conn = await pool.getConnection();
+        try {
+          await conn.executeMany(insertSql(table, columns), rows as unknown[][], {
+            autoCommit: true,
+          });
+          return rows.length;
+        } finally {
+          await conn.close();
+        }
+      },
+      ping: async () => {
+        await run('SELECT 1 FROM dual');
+      },
+      cleanup,
+      transaction: async <T>(fn: (tx: SqlExecutor) => Promise<T>) => {
+        const conn = await pool.getConnection();
+        const tq = async <U>(sql: string, params: unknown[] = []) => {
+          const r = await conn.execute(
+            sql,
+            params as oracledb.BindParameters,
+            txOpts,
+          );
+          return (r.rows ?? []) as U[];
+        };
+        try {
+          const result = await fn({
+            engine,
+            query: tq,
+            bulkInsert: async (table, columns, rows) => {
+              if (rows.length === 0) return 0;
+              await conn.executeMany(
+                insertSql(table, columns),
+                rows as unknown[][],
+                { autoCommit: false },
+              );
+              return rows.length;
+            },
+          });
+          await conn.commit();
+          return result;
+        } catch (err) {
+          try {
+            await conn.rollback();
+          } catch {
+            /* ignore */
+          }
+          throw err;
+        } finally {
+          await conn.close();
         }
       },
     };

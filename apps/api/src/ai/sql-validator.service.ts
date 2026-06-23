@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Parser } from 'node-sql-parser';
-import { DbEngine, parserDialect } from '../common/db/engine';
+import { DbEngine, parserDialectCandidates } from '../common/db/engine';
 
 export interface ValidationResult {
   valid: boolean;
@@ -62,9 +62,7 @@ export class SqlValidatorService {
 
     // 3. AST parsing — catches obfuscated injections
     try {
-      const ast = this.parser.astify(trimmed, {
-        database: parserDialect(engine),
-      });
+      const ast = this.astifyAny(trimmed, engine);
       const statements = Array.isArray(ast) ? ast : [ast];
 
       // Multiple statements = injection attempt
@@ -133,34 +131,54 @@ export class SqlValidatorService {
     return { explanation, confidence };
   }
 
+  /**
+   * Parse SQL trying each candidate dialect for the engine, returning the first
+   * AST that parses. Throws if none do (so callers fail closed). Oracle has no
+   * native grammar, so it relies on the closest dialects.
+   */
+  private astifyAny(sql: string, engine: DbEngine): unknown {
+    let lastErr: unknown;
+    for (const database of parserDialectCandidates(engine)) {
+      try {
+        return this.parser.astify(sql, { database });
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr;
+  }
+
   /** Tables and columns a query reads, derived from the parsed AST. */
   extractAccessed(
     sql: string,
     engine: DbEngine = 'mysql',
   ): { tables: string[]; columns: string[] } {
-    try {
-      const opt = { database: parserDialect(engine) };
-      // tableList → "select::dbName::tableName"; columnList → "select::table::col"
-      const tables = [
-        ...new Set(
-          this.parser
-            .tableList(sql, opt)
-            .map((t) => t.split('::').pop() ?? '')
-            .filter(Boolean),
-        ),
-      ];
-      const columns = [
-        ...new Set(
-          this.parser
-            .columnList(sql, opt)
-            .map((c) => c.split('::').pop() ?? '')
-            .filter((c) => c && c !== '(.*)' && c !== '*'),
-        ),
-      ];
-      return { tables, columns };
-    } catch {
-      return { tables: [], columns: [] };
+    for (const database of parserDialectCandidates(engine)) {
+      try {
+        const opt = { database };
+        // tableList → "select::dbName::tableName"; columnList → "select::table::col"
+        const tables = [
+          ...new Set(
+            this.parser
+              .tableList(sql, opt)
+              .map((t) => t.split('::').pop() ?? '')
+              .filter(Boolean),
+          ),
+        ];
+        const columns = [
+          ...new Set(
+            this.parser
+              .columnList(sql, opt)
+              .map((c) => c.split('::').pop() ?? '')
+              .filter((c) => c && c !== '(.*)' && c !== '*'),
+          ),
+        ];
+        return { tables, columns };
+      } catch {
+        /* try the next candidate dialect */
+      }
     }
+    return { tables: [], columns: [] };
   }
 
   isCannotAnswer(aiResponse: string): { is: boolean; reason: string } {

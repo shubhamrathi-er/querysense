@@ -9,6 +9,7 @@ import { EncryptionService } from '../../common/encryption/encryption.service';
 import { MysqlAdapter } from './dialect/mysql.adapter';
 import { PostgresAdapter } from './dialect/postgres.adapter';
 import { SqlServerAdapter } from './dialect/sqlserver.adapter';
+import { OracleAdapter } from './dialect/oracle.adapter';
 import { buildSshConfig } from '../../common/db/mysql-pool';
 import {
   normalizeEngine,
@@ -517,6 +518,7 @@ export class MigrationValidationService {
     }
     if (engine === 'postgres') return new PostgresAdapter(cfg);
     if (engine === 'sqlserver') return new SqlServerAdapter(cfg);
+    if (engine === 'oracle') return new OracleAdapter(cfg);
     return new MysqlAdapter(cfg);
   }
 }

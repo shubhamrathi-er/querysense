@@ -12,6 +12,7 @@ import {
   createPostgresPool,
   createSqlServerPool,
   createSnowflakePool,
+  createOraclePool,
   buildSshConfig,
 } from '../common/db/mysql-pool';
 import { DbEngine, normalizeEngine } from '../common/db/engine';
@@ -856,6 +857,8 @@ export class ConversationsService {
       return this.executePaginatedSqlServer(poolCfg, sql, page, pageSize, offset);
     if (engine === 'snowflake')
       return this.executePaginatedSnowflake(poolCfg, sql, page, pageSize, offset);
+    if (engine === 'oracle')
+      return this.executePaginatedOracle(poolCfg, sql, page, pageSize, offset);
     return this.executePaginatedMysql(poolCfg, sql, page, pageSize, offset);
   }
 
@@ -1178,6 +1181,70 @@ export class ConversationsService {
       };
     } finally {
       await sf.cleanup();
+    }
+  }
+
+  private async executePaginatedOracle(
+    poolCfg: Parameters<typeof createOraclePool>[0],
+    sql: string,
+    page: number,
+    pageSize: number,
+    offset: number,
+  ) {
+    const { pool, cleanup } = await createOraclePool(poolCfg);
+    const start = Date.now();
+    const oracledb = await import('oracledb');
+    const fieldsOf = (rows: Record<string, unknown>[]) =>
+      rows[0] ? Object.keys(rows[0]).map((name) => ({ name, type: 0 })) : [];
+    const run = async (text: string) => {
+      const conn = await pool.getConnection();
+      try {
+        const r = await conn.execute(text, [], {
+          outFormat: oracledb.OUT_FORMAT_OBJECT,
+          fetchTypeHandler: (meta: { dbType?: unknown }) => {
+            if (meta.dbType === oracledb.DB_TYPE_CLOB) return { type: oracledb.STRING };
+            if (meta.dbType === oracledb.DB_TYPE_BLOB) return { type: oracledb.BUFFER };
+            return undefined;
+          },
+        });
+        return (r.rows ?? []) as Record<string, unknown>[];
+      } finally {
+        await conn.close();
+      }
+    };
+    try {
+      let totalCount = 0;
+      try {
+        const c = await run(`SELECT COUNT(*) AS "total" FROM (${sql})`);
+        totalCount = Number(c[0]?.['total'] ?? 0);
+      } catch {
+        const rows = await run(sql);
+        return {
+          rows,
+          fields: fieldsOf(rows),
+          rowCount: rows.length,
+          totalCount: rows.length,
+          page: 1,
+          pageSize: rows.length,
+          totalPages: 1,
+          executionTimeMs: Date.now() - start,
+        };
+      }
+      const rows = await run(
+        `${sql} OFFSET ${offset} ROWS FETCH NEXT ${pageSize} ROWS ONLY`,
+      );
+      return {
+        rows,
+        fields: fieldsOf(rows),
+        rowCount: rows.length,
+        totalCount,
+        page,
+        pageSize,
+        totalPages: Math.ceil(totalCount / pageSize),
+        executionTimeMs: Date.now() - start,
+      };
+    } finally {
+      await cleanup();
     }
   }
 

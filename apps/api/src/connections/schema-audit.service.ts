@@ -179,6 +179,7 @@ export class SchemaAuditService {
     try {
       if (engine === 'postgres') return await this.introspectPostgres(client);
       if (engine === 'sqlserver') return await this.introspectSqlServer(client);
+      if (engine === 'oracle') return await this.introspectOracle(client);
       return await this.introspectMysql(client, connection.databaseName);
     } finally {
       await client.cleanup();
@@ -547,6 +548,130 @@ export class SchemaAuditService {
     }
 
     return [...tables.values()];
+  }
+
+  /**
+   * Oracle equivalent of introspectMysql via the USER_* data-dictionary views
+   * (current schema). engine/collation left null; Oracle types mapped to the
+   * MySQL-ish tokens the rules expect; IDENTITY columns marked auto_increment.
+   */
+  private async introspectOracle(client: SqlClient): Promise<TableModel[]> {
+    const tableRows = await client.query<Record<string, unknown>>(
+      `SELECT table_name AS "name", NVL(num_rows, 0) AS "rowCount", 'TABLE' AS "kind" FROM user_tables
+       UNION ALL
+       SELECT view_name AS "name", 0 AS "rowCount", 'VIEW' AS "kind" FROM user_views`,
+    );
+    const colRows = await client.query<Record<string, unknown>>(
+      `SELECT table_name AS "tableName", column_name AS "columnName", data_type AS "dataType",
+              char_length AS "charLen", data_precision AS "prec", data_scale AS "scale",
+              CASE WHEN nullable = 'Y' THEN 'YES' ELSE 'NO' END AS "isNullable",
+              identity_column AS "identity"
+       FROM user_tab_columns ORDER BY table_name, column_id`,
+    );
+    const pkRows = await client.query<Record<string, unknown>>(
+      `SELECT cc.table_name AS "tableName", cc.column_name AS "columnName"
+       FROM user_constraints c JOIN user_cons_columns cc ON cc.constraint_name = c.constraint_name
+       WHERE c.constraint_type = 'P'`,
+    );
+    const fkRows = await client.query<Record<string, unknown>>(
+      `SELECT acc.table_name AS "tableName", acc.column_name AS "columnName"
+       FROM user_constraints a JOIN user_cons_columns acc ON acc.constraint_name = a.constraint_name
+       WHERE a.constraint_type = 'R'`,
+    );
+    const idxRows = await client.query<Record<string, unknown>>(
+      `SELECT i.table_name AS "tableName", i.index_name AS "indexName",
+              CASE WHEN i.uniqueness = 'UNIQUE' THEN 1 ELSE 0 END AS "isUnique",
+              ic.column_name AS "columnName", ic.column_position AS "seq"
+       FROM user_indexes i JOIN user_ind_columns ic ON ic.index_name = i.index_name
+       ORDER BY i.table_name, i.index_name, ic.column_position`,
+    );
+
+    const pkSet = new Set(
+      pkRows.map((r) => `${String(r['tableName'])}.${String(r['columnName'])}`),
+    );
+
+    const tables = new Map<string, TableModel>();
+    for (const r of tableRows) {
+      const name = String(r['name']);
+      tables.set(name, {
+        name,
+        engine: null,
+        collation: null,
+        rowCount: Number(r['rowCount'] ?? 0),
+        isView: String(r['kind']) === 'VIEW',
+        columns: [],
+        indexes: [],
+        pk: [],
+        fkColumns: new Set(),
+      });
+    }
+
+    for (const r of colRows) {
+      const t = tables.get(String(r['tableName']));
+      if (!t) continue;
+      const name = String(r['columnName']);
+      const dataType = this.mapOracleType(String(r['dataType']));
+      const isPk = pkSet.has(`${t.name}.${name}`);
+      const charLen = r['charLen'];
+      const columnType =
+        charLen !== null && charLen !== undefined && Number(charLen) > 0
+          ? `${dataType}(${Number(charLen)})`
+          : dataType === 'decimal' && r['prec'] != null
+            ? `${dataType}(${Number(r['prec'])},${Number(r['scale'] ?? 0)})`
+            : dataType;
+      const col: ColModel = {
+        name,
+        columnType,
+        dataType,
+        isNullable: String(r['isNullable']).toUpperCase() === 'YES',
+        columnKey: isPk ? 'PRI' : '',
+        extra: String(r['identity'] ?? '').toUpperCase() === 'YES' ? 'auto_increment' : '',
+        collation: null,
+      };
+      t.columns.push(col);
+      if (isPk) t.pk.push(name);
+    }
+
+    const idxByTable = new Map<string, Map<string, IndexModel>>();
+    for (const r of idxRows) {
+      const tableName = String(r['tableName']);
+      if (!tables.has(tableName)) continue;
+      const idxName = String(r['indexName']);
+      let byName = idxByTable.get(tableName);
+      if (!byName) {
+        byName = new Map();
+        idxByTable.set(tableName, byName);
+      }
+      let idx = byName.get(idxName);
+      if (!idx) {
+        idx = { name: idxName, columns: [], unique: Number(r['isUnique']) === 1 };
+        byName.set(idxName, idx);
+      }
+      idx.columns.push(String(r['columnName']));
+    }
+    for (const [tableName, byName] of idxByTable) {
+      const t = tables.get(tableName);
+      if (t) t.indexes = [...byName.values()];
+    }
+
+    for (const r of fkRows) {
+      const t = tables.get(String(r['tableName']));
+      if (t) t.fkColumns.add(String(r['columnName']));
+    }
+
+    return [...tables.values()];
+  }
+
+  /** Map an Oracle data type to the MySQL-ish token the rules check against. */
+  private mapOracleType(t: string): string {
+    const v = t.toLowerCase();
+    if (v === 'varchar2' || v === 'nvarchar2') return 'varchar';
+    if (v === 'char' || v === 'nchar') return 'char';
+    if (v === 'clob' || v === 'nclob' || v === 'long') return 'text';
+    if (v === 'number') return 'decimal';
+    if (v === 'float' || v === 'binary_float') return 'float';
+    if (v === 'binary_double') return 'double';
+    return v; // date, timestamp, blob, etc.
   }
 
   /** Map a SQL Server data type to the MySQL-ish token the rules check against. */

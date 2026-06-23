@@ -11,7 +11,8 @@ export type DbEngine =
   | 'postgres'
   | 'redshift'
   | 'sqlserver'
-  | 'snowflake';
+  | 'snowflake'
+  | 'oracle';
 
 export const DB_ENGINES: readonly DbEngine[] = [
   'mysql',
@@ -20,6 +21,7 @@ export const DB_ENGINES: readonly DbEngine[] = [
   'redshift',
   'sqlserver',
   'snowflake',
+  'oracle',
 ] as const;
 
 /**
@@ -33,6 +35,7 @@ export const DEFAULT_PORTS: Record<DbEngine, number> = {
   redshift: 5439,
   sqlserver: 1433,
   snowflake: 443,
+  oracle: 1521,
 };
 
 /** MariaDB speaks the MySQL wire protocol and SQL dialect. */
@@ -58,6 +61,7 @@ export const ENGINE_LABELS: Record<DbEngine, string> = {
   redshift: 'Amazon Redshift',
   sqlserver: 'SQL Server',
   snowflake: 'Snowflake',
+  oracle: 'Oracle',
 };
 
 /**
@@ -73,6 +77,7 @@ export function normalizeEngine(value: string | null | undefined): DbEngine {
   if (v === 'mariadb' || v === 'maria') return 'mariadb';
   if (v === 'redshift') return 'redshift';
   if (v === 'snowflake' || v === 'sf') return 'snowflake';
+  if (v === 'oracle' || v === 'oracledb' || v === 'oracle_db') return 'oracle';
   return 'mysql';
 }
 
@@ -85,8 +90,9 @@ export function quoteIdent(engine: DbEngine, name: string): string {
   if (name.includes('\0')) {
     throw new Error('Identifier contains a NUL byte');
   }
-  if (isPostgresFamily(engine) || engine === 'snowflake') {
-    // Snowflake also uses double-quoted identifiers (and folds unquoted to upper).
+  if (isPostgresFamily(engine) || engine === 'snowflake' || engine === 'oracle') {
+    // Snowflake & Oracle also use double-quoted identifiers (folding unquoted to
+    // upper-case), so case-sensitive names must be quoted.
     return `"${name.replace(/"/g, '""')}"`;
   }
   if (engine === 'sqlserver') {
@@ -98,13 +104,29 @@ export function quoteIdent(engine: DbEngine, name: string): string {
   return `\`${name}\``;
 }
 
+export type ParserDialect =
+  | 'MySQL'
+  | 'PostgreSQL'
+  | 'transactsql'
+  | 'redshift'
+  | 'snowflake';
+
 /** The dialect string node-sql-parser expects for this engine. */
-export function parserDialect(
-  engine: DbEngine,
-): 'MySQL' | 'PostgreSQL' | 'transactsql' | 'redshift' | 'snowflake' {
+export function parserDialect(engine: DbEngine): ParserDialect {
   if (engine === 'postgres') return 'PostgreSQL';
   if (engine === 'redshift') return 'redshift';
   if (engine === 'sqlserver') return 'transactsql';
   if (engine === 'snowflake') return 'snowflake';
   return 'MySQL';
+}
+
+/**
+ * Candidate parser dialects to try, in order. node-sql-parser has no Oracle
+ * grammar, so for Oracle we try the closest dialects and fail closed (reject)
+ * if none parse — common Oracle SELECTs parse; Oracle-specific syntax is
+ * rejected rather than wrongly allowed.
+ */
+export function parserDialectCandidates(engine: DbEngine): ParserDialect[] {
+  if (engine === 'oracle') return ['transactsql', 'PostgreSQL', 'MySQL'];
+  return [parserDialect(engine)];
 }

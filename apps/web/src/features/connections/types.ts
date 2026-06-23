@@ -4,7 +4,8 @@ export type DatabaseEngine =
   | 'postgres'
   | 'redshift'
   | 'sqlserver'
-  | 'snowflake';
+  | 'snowflake'
+  | 'oracle';
 
 export interface Connection {
   id: string;

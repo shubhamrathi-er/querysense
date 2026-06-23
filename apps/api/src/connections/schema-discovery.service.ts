@@ -107,7 +107,9 @@ export class SchemaDiscoveryService {
               ? await this.discoverSnowflake(client)
               : engine === 'sqlserver'
                 ? await this.discoverSqlServer(client)
-                : await this.discoverMysql(client, config.databaseName);
+                : engine === 'oracle'
+                  ? await this.discoverOracle(client)
+                  : await this.discoverMysql(client, config.databaseName);
 
       this.logger.log(
         `Discovered ${tables.length} tables in ${config.databaseName} (${engine})`,
@@ -407,6 +409,55 @@ export class SchemaDiscoveryService {
     );
 
     return this.assemble(tableRows, columnRows, [], () => false);
+  }
+
+  /**
+   * Oracle discovery via the data-dictionary USER_* views (current schema; Oracle
+   * has no information_schema). Tables + views, columns, and PK/FK constraints.
+   */
+  private async discoverOracle(client: SqlClient): Promise<DiscoveredTable[]> {
+    const tableRows = await client.query<TableRow>(
+      `SELECT table_name AS "tableName", 'BASE TABLE' AS "tableType",
+              NVL(num_rows, 0) AS "rowCount", '' AS "tableComment"
+       FROM user_tables
+       UNION ALL
+       SELECT view_name AS "tableName", 'VIEW' AS "tableType",
+              0 AS "rowCount", '' AS "tableComment"
+       FROM user_views`,
+    );
+    if (tableRows.length === 0) return [];
+
+    const columnRows = await client.query<ColumnRow>(
+      `SELECT table_name AS "tableName", column_name AS "columnName",
+              data_type AS "dataType",
+              CASE WHEN nullable = 'Y' THEN 'YES' ELSE 'NO' END AS "isNullable",
+              column_id AS "ordinalPosition", '' AS "columnComment"
+       FROM user_tab_columns
+       ORDER BY table_name, column_id`,
+    );
+
+    const pkRows = await client.query<KeyRow>(
+      `SELECT cc.table_name AS "tableName", cc.column_name AS "columnName"
+       FROM user_constraints c
+       JOIN user_cons_columns cc ON cc.constraint_name = c.constraint_name
+       WHERE c.constraint_type = 'P'`,
+    );
+
+    const fkRows = await client.query<ForeignKeyRow>(
+      `SELECT acc.table_name AS "tableName", acc.column_name AS "columnName",
+              pk.table_name AS "referencesTable", pkc.column_name AS "referencesColumn"
+       FROM user_constraints a
+       JOIN user_cons_columns acc ON acc.constraint_name = a.constraint_name
+       JOIN user_constraints pk ON pk.constraint_name = a.r_constraint_name
+       JOIN user_cons_columns pkc ON pkc.constraint_name = pk.constraint_name
+                                 AND pkc.position = acc.position
+       WHERE a.constraint_type = 'R'`,
+    );
+
+    const pkSet = new Set(pkRows.map((r) => `${r.tableName}.${r.columnName}`));
+    return this.assemble(tableRows, columnRows, fkRows, (c) =>
+      pkSet.has(`${c.tableName}.${c.columnName}`),
+    );
   }
 
   /** Shared assembly of the per-engine row sets into DiscoveredTable[]. */

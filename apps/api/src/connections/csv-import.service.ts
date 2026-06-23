@@ -123,7 +123,9 @@ export class CsvImportService {
           ? await this.pgImportTargets(ctx)
           : ctx.engine === 'sqlserver'
             ? await this.sqlServerImportTargets(ctx)
-            : await this.mysqlImportTargets(ctx);
+            : ctx.engine === 'oracle'
+              ? await this.oracleImportTargets(ctx)
+              : await this.mysqlImportTargets(ctx);
 
       const byTable = new Map<string, ImportTargetColumn[]>();
       for (const col of rows) {
@@ -247,6 +249,39 @@ export class CsvImportService {
     return rows.map((r) => {
       const isNullable = String(r['isNullable']).toUpperCase() === 'YES';
       const isAutoIncrement = Number(r['isIdentity']) === 1;
+      const hasDefault = r['columnDefault'] !== null || isAutoIncrement;
+      const charLen = r['charLen'];
+      const dataType =
+        charLen !== null && charLen !== undefined && Number(charLen) > 0
+          ? `${String(r['dataType'])}(${Number(charLen)})`
+          : String(r['dataType']);
+      return {
+        tableName: String(r['tableName']),
+        column: {
+          columnName: String(r['columnName']),
+          dataType,
+          isNullable,
+          isAutoIncrement,
+          hasDefault,
+          isRequired: !isNullable && !hasDefault && !isAutoIncrement,
+        } satisfies ImportTargetColumn,
+      };
+    });
+  }
+
+  private async oracleImportTargets(ctx: ImportCtx) {
+    const rows = await ctx.client.query<Record<string, unknown>>(
+      `SELECT c.table_name AS "tableName", c.column_name AS "columnName",
+              c.data_type AS "dataType", c.char_length AS "charLen",
+              CASE WHEN c.nullable = 'Y' THEN 'YES' ELSE 'NO' END AS "isNullable",
+              c.data_default AS "columnDefault", c.identity_column AS "isIdentity"
+       FROM user_tab_columns c
+       WHERE c.table_name IN (SELECT table_name FROM user_tables)
+       ORDER BY c.table_name, c.column_id`,
+    );
+    return rows.map((r) => {
+      const isNullable = String(r['isNullable']).toUpperCase() === 'YES';
+      const isAutoIncrement = String(r['isIdentity'] ?? '').toUpperCase() === 'YES';
       const hasDefault = r['columnDefault'] !== null || isAutoIncrement;
       const charLen = r['charLen'];
       const dataType =
@@ -396,11 +431,19 @@ export class CsvImportService {
     escTable: string,
     dto: CsvImportDto,
   ): Promise<void> {
-    const exists = await ctx.client.query(
-      `SELECT 1 FROM information_schema.tables
-       WHERE table_schema = ${ctx.d.currentSchemaExpr()} AND table_name = ${this.ph(ctx, 1)} LIMIT 1`,
-      [dto.tableName],
-    );
+    const exists =
+      ctx.engine === 'oracle'
+        ? await ctx.client.query(
+            `SELECT 1 AS x FROM user_objects WHERE object_name = :1 AND object_type IN ('TABLE', 'VIEW')`,
+            [dto.tableName],
+          )
+        : await ctx.client.query(
+            // Filtering by exact name returns at most one row (no LIMIT needed —
+            // and LIMIT isn't valid on SQL Server).
+            `SELECT 1 AS x FROM information_schema.tables
+             WHERE table_schema = ${ctx.d.currentSchemaExpr()} AND table_name = ${this.ph(ctx, 1)}`,
+            [dto.tableName],
+          );
     if (exists.length > 0) {
       throw new ConflictException(
         `Table "${dto.tableName}" already exists. Choose a different name or insert into the existing table.`,
@@ -455,13 +498,22 @@ export class CsvImportService {
     escTable: string,
     dto: CsvImportDto,
   ): Promise<string[]> {
-    const cols = await ctx.client.query<Record<string, unknown>>(
-      `SELECT column_name AS "columnName", is_nullable AS "isNullable",
-              column_default AS "columnDefault", ${this.identityExpr(ctx)} AS "isAuto"
-       FROM information_schema.columns
-       WHERE table_schema = ${ctx.d.currentSchemaExpr()} AND table_name = ${this.ph(ctx, 1)}`,
-      [dto.tableName],
-    );
+    const cols =
+      ctx.engine === 'oracle'
+        ? await ctx.client.query<Record<string, unknown>>(
+            `SELECT column_name AS "columnName",
+                    CASE WHEN nullable = 'Y' THEN 'YES' ELSE 'NO' END AS "isNullable",
+                    data_default AS "columnDefault", identity_column AS "isAuto"
+             FROM user_tab_columns WHERE table_name = :1`,
+            [dto.tableName],
+          )
+        : await ctx.client.query<Record<string, unknown>>(
+            `SELECT column_name AS "columnName", is_nullable AS "isNullable",
+                    column_default AS "columnDefault", ${this.identityExpr(ctx)} AS "isAuto"
+             FROM information_schema.columns
+             WHERE table_schema = ${ctx.d.currentSchemaExpr()} AND table_name = ${this.ph(ctx, 1)}`,
+            [dto.tableName],
+          );
 
     if (cols.length === 0) {
       throw new NotFoundException(
@@ -661,6 +713,7 @@ export class CsvImportService {
   private ph(ctx: ImportCtx, n: number): string {
     if (ctx.engine === 'postgres') return `$${n}`;
     if (ctx.engine === 'sqlserver') return `@p${n - 1}`;
+    if (ctx.engine === 'oracle') return `:${n}`;
     return '?';
   }
 
@@ -678,6 +731,7 @@ export class CsvImportService {
       return String(value ?? '').toUpperCase() === 'YES';
     }
     if (ctx.engine === 'sqlserver') return Number(value) === 1;
+    if (ctx.engine === 'oracle') return String(value ?? '').toUpperCase() === 'YES';
     return String(value ?? '')
       .toLowerCase()
       .includes('auto_increment');
@@ -722,6 +776,27 @@ export class CsvImportService {
         )
         .join(' OR ');
       return { whereSql: ors, params: chunk.flat() };
+    }
+
+    if (ctx.engine === 'oracle') {
+      // Oracle supports row-value IN with literal tuples; uses :n placeholders.
+      if (width === 1) {
+        const placeholders = chunk.map((_, i) => `:${i + 1}`).join(', ');
+        return {
+          whereSql: `${escKeyCols[0]} IN (${placeholders})`,
+          params: chunk.map((t) => t[0]),
+        };
+      }
+      const tuples = chunk
+        .map(
+          (_, ri) =>
+            `(${escKeyCols.map((__, ci) => `:${ri * width + ci + 1}`).join(', ')})`,
+        )
+        .join(', ');
+      return {
+        whereSql: `(${escKeyCols.join(', ')}) IN (${tuples})`,
+        params: chunk.flat(),
+      };
     }
 
     // Postgres: explicit positional placeholders.

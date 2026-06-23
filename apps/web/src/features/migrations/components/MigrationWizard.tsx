@@ -242,6 +242,7 @@ export function MigrationWizard({ onClose }: Props) {
                   e === 'postgres' ? 'PostgreSQL'
                   : e === 'sqlserver' ? 'SQL Server'
                   : e === 'mariadb' ? 'MariaDB'
+                  : e === 'oracle' ? 'Oracle'
                   : e === 'mysql' ? 'MySQL'
                   : null;
                 return name ? `${name} → ${name}` : 'Same-engine copy';

@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Parser } from 'node-sql-parser';
-import { DbEngine, parserDialect } from '../common/db/engine';
+import { DbEngine, parserDialectCandidates } from '../common/db/engine';
 
 export interface GuardResult {
   allowed: boolean;
@@ -27,9 +27,18 @@ export class SqlGuardService {
   /** Structural checks that need no DB access (subquery depth). */
   checkStructure(sql: string, engine: DbEngine = 'mysql'): GuardResult {
     let ast: unknown;
-    try {
-      ast = this.parser.astify(sql, { database: parserDialect(engine) });
-    } catch {
+    const candidates = parserDialectCandidates(engine);
+    let parsed = false;
+    for (const database of candidates) {
+      try {
+        ast = this.parser.astify(sql, { database });
+        parsed = true;
+        break;
+      } catch {
+        /* try the next candidate dialect */
+      }
+    }
+    if (!parsed) {
       // Unparseable SQL is rejected by SqlValidatorService (fail-closed); don't
       // double-handle it here.
       return { allowed: true };

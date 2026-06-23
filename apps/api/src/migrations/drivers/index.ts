@@ -3,6 +3,7 @@ import type { MigrationConn, MigrationDriver } from './migration-driver';
 import { MysqlMigrationDriver } from './mysql-migration.driver';
 import { PostgresMigrationDriver } from './postgres-migration.driver';
 import { SqlServerMigrationDriver } from './sqlserver-migration.driver';
+import { OracleMigrationDriver } from './oracle-migration.driver';
 
 export * from './migration-driver';
 
@@ -14,5 +15,6 @@ export function createMigrationDriver(
 ): MigrationDriver {
   if (engine === 'postgres') return new PostgresMigrationDriver(source, target);
   if (engine === 'sqlserver') return new SqlServerMigrationDriver(source, target);
+  if (engine === 'oracle') return new OracleMigrationDriver(source, target);
   return new MysqlMigrationDriver(source, target);
 }

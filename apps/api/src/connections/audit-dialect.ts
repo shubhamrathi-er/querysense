@@ -98,8 +98,34 @@ const sqlServerDialect: AuditDialect = {
   hasCharsets: false,
 };
 
+const oracleDialect: AuditDialect = {
+  engine: 'oracle',
+  q: (n) => quoteIdent('oracle', n),
+  addIdPk: (t) =>
+    `ALTER TABLE ${quoteIdent('oracle', t)} ADD "id" NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY;`,
+  addForeignKey: (t, c, ref) =>
+    `ALTER TABLE ${quoteIdent('oracle', t)} ADD CONSTRAINT "fk_${t}_${c}" FOREIGN KEY (${quoteIdent('oracle', c)}) REFERENCES ${quoteIdent('oracle', ref)}("id");`,
+  createIndex: (t, c) =>
+    `CREATE INDEX "idx_${t}_${c}" ON ${quoteIdent('oracle', t)}(${quoteIdent('oracle', c)});`,
+  createUniqueIndex: (t, c) =>
+    `CREATE UNIQUE INDEX "uq_${t}_${c}" ON ${quoteIdent('oracle', t)}(${quoteIdent('oracle', c)});`,
+  // Oracle: ADD (cols); no ON UPDATE (use a trigger).
+  addTimestamps: (t) =>
+    `ALTER TABLE ${quoteIdent('oracle', t)} ADD ("created_at" TIMESTAMP DEFAULT SYSTIMESTAMP, "updated_at" TIMESTAMP DEFAULT SYSTIMESTAMP);`,
+  setColumnDecimal: (t, c) =>
+    `ALTER TABLE ${quoteIdent('oracle', t)} MODIFY (${quoteIdent('oracle', c)} NUMBER(12,2));`,
+  setColumnBoolean: (t, c) =>
+    `ALTER TABLE ${quoteIdent('oracle', t)} MODIFY (${quoteIdent('oracle', c)} NUMBER(1));`,
+  widenPkToBigint: (t, c) =>
+    `ALTER TABLE ${quoteIdent('oracle', t)} MODIFY (${quoteIdent('oracle', c)} NUMBER(19));`,
+  booleanTypeLabel: 'NUMBER(1)',
+  hasStorageEngines: false,
+  hasCharsets: false,
+};
+
 export function auditDialect(engine: DbEngine): AuditDialect {
   if (engine === 'postgres') return postgresDialect;
   if (engine === 'sqlserver') return sqlServerDialect;
+  if (engine === 'oracle') return oracleDialect;
   return mysqlDialect;
 }

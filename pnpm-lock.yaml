@@ -80,6 +80,9 @@ importers:
       node-sql-parser:
         specifier: ^5.4.0
         version: 5.4.0
+      oracledb:
+        specifier: ^7.0.0
+        version: 7.0.0
       passport:
         specifier: ^0.7.0
         version: 0.7.0
@@ -150,6 +153,9 @@ importers:
       '@types/node':
         specifier: ^24.0.0
         version: 24.13.0
+      '@types/oracledb':
+        specifier: ^7.0.1
+        version: 7.0.1
       '@types/passport-jwt':
         specifier: ^4.0.1
         version: 4.0.1
@@ -2415,6 +2421,9 @@ packages:
 
   '@types/node@24.13.0':
     resolution: {integrity: sha512-5vtOqGQr4NJKeEzV441FcOi2MeG9UTWq9LqVLGneDdu4vlX17H8kQ2PA2UmNwCUGPVDj4oBjNhS7ReVEIWJJrg==}
+
+  '@types/oracledb@7.0.1':
+    resolution: {integrity: sha512-0A6m9YE4yu73KXehr5D6cbyALUzZoANGY4bG5cAPQIpJoJG4eMVPbR1Vau8ycnC25V/+F4Au1pdFSy8ODOAD0w==}
 
   '@types/passport-jwt@4.0.1':
     resolution: {integrity: sha512-Y0Ykz6nWP4jpxgEUYq8NoVZeCQPo1ZndJLfapI249g1jHChvRfZRO/LS3tqu26YgAS/laI1qx98sYGz0IalRXQ==}
@@ -5190,6 +5199,10 @@ packages:
   ora@5.4.1:
     resolution: {integrity: sha512-5b6Y85tPxZZ7QytO+BQzysW31HJku27cRIlkbAXaNx+BdcVi+LlRFmVXzeF6a7JCwJpyw5c4b+YSVImQIrBpuQ==}
     engines: {node: '>=10'}
+
+  oracledb@7.0.0:
+    resolution: {integrity: sha512-aPt1oB++zOQ0QsuRLlSbQjydTOg1RTMmfnShoEfETfgiZ0uzmCptHfK/pNLXovl6FVnFoevxX8yfrEme4ksbXg==}
+    engines: {node: '>=14.17'}
 
   own-keys@1.0.1:
     resolution: {integrity: sha512-qFOyK5PjiWZd+QQIh+1jhdb9LpxTF0qs7Pm8o5QHYZ0M3vKqSqzsZaEB6oWlxZ+q2sJBMI/Ktgd2N5ZwQoRHfg==}
@@ -8865,6 +8878,10 @@ snapshots:
     dependencies:
       undici-types: 7.18.2
 
+  '@types/oracledb@7.0.1':
+    dependencies:
+      '@types/node': 24.13.0
+
   '@types/passport-jwt@4.0.1':
     dependencies:
       '@types/jsonwebtoken': 9.0.10
@@ -12058,6 +12075,8 @@ snapshots:
       log-symbols: 4.1.0
       strip-ansi: 6.0.1
       wcwidth: 1.0.1
+
+  oracledb@7.0.0: {}
 
   own-keys@1.0.1:
     dependencies:

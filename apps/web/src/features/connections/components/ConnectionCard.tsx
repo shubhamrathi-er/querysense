@@ -5,7 +5,7 @@ import { motion } from 'framer-motion';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import {
   RefreshCw, Trash2, CheckCircle2, Clock, Loader2,
-  Table2, Network, MoreVertical,
+  Table2, Network, MoreVertical, Database,
 } from 'lucide-react';
 import { SiMysql, SiPostgresql, SiMariadb, SiSnowflake } from 'react-icons/si';
 import { DiMsqlServer, DiAws } from 'react-icons/di';
@@ -105,6 +105,8 @@ export function ConnectionCard({ connection, index = 0 }: Props) {
             <DiAws className="h-7 w-7" style={{ color: '#C73A36' }} />
           ) : connection.engine === 'snowflake' ? (
             <SiSnowflake className="h-7 w-7" style={{ color: '#29B5E8' }} />
+          ) : connection.engine === 'oracle' ? (
+            <Database className="h-7 w-7" style={{ color: '#F80000' }} />
           ) : (
             <SiMysql className="h-7 w-7" style={{ color: '#00758F' }} />
           )}
@@ -130,7 +132,9 @@ export function ConnectionCard({ connection, index = 0 }: Props) {
                       ? 'Redshift'
                       : connection.engine === 'snowflake'
                         ? 'Snowflake'
-                        : 'MySQL'}
+                        : connection.engine === 'oracle'
+                          ? 'Oracle'
+                          : 'MySQL'}
             </span>
             {'  ·  '}
             {connection.host}:{connection.port}/{connection.databaseName}

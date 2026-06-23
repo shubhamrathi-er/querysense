@@ -60,6 +60,19 @@ function dialectGuidance(engine: DbEngine): DialectGuidance {
       ],
     };
   }
+  if (engine === 'oracle') {
+    return {
+      name: 'Oracle',
+      lastMonth: `WHERE date_col >= TRUNC(ADD_MONTHS(SYSDATE, -1), 'MM') AND date_col < TRUNC(SYSDATE, 'MM')`,
+      thisYear: `WHERE EXTRACT(YEAR FROM date_col) = EXTRACT(YEAR FROM SYSDATE)`,
+      limitRule:
+        'Do NOT add ROWNUM, FETCH FIRST or OFFSET — the system paginates results automatically. Include ORDER BY when ordering matters.',
+      extraRules: [
+        `Oracle folds unquoted identifiers to UPPERCASE — double-quote any identifier that must keep its case.`,
+        `Use the dual table for constant selects; string concat is || .`,
+      ],
+    };
+  }
   if (engine === 'sqlserver') {
     return {
       name: 'SQL Server',

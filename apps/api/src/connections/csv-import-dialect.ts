@@ -44,6 +44,18 @@ const SS_TYPE_MAP: Record<string, string> = {
   BOOLEAN: 'BIT',
 };
 
+const ORA_TYPE_MAP: Record<string, string> = {
+  INT: 'NUMBER(10)',
+  BIGINT: 'NUMBER(19)',
+  DOUBLE: 'BINARY_DOUBLE',
+  'DECIMAL(18,4)': 'NUMBER(18,4)',
+  'VARCHAR(255)': 'VARCHAR2(255)',
+  TEXT: 'CLOB',
+  DATE: 'DATE',
+  DATETIME: 'TIMESTAMP',
+  BOOLEAN: 'NUMBER(1)',
+};
+
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export interface CsvDialect {
@@ -101,8 +113,19 @@ const sqlserver: CsvDialect = {
   currentSchemaExpr: () => 'SCHEMA_NAME()',
 };
 
+const oracle: CsvDialect = {
+  engine: 'oracle',
+  ident: (n) => ident('oracle', n),
+  isAllowedType: (t) => CANONICAL_TYPES.has(t),
+  sqlType: (t) => ORA_TYPE_MAP[t] ?? t,
+  surrogateKeyDef: () => '"id" NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY',
+  createTableTail: () => '',
+  currentSchemaExpr: () => "SYS_CONTEXT('USERENV','CURRENT_SCHEMA')",
+};
+
 export function csvDialect(engine: DbEngine): CsvDialect {
   if (engine === 'postgres') return postgres;
   if (engine === 'sqlserver') return sqlserver;
+  if (engine === 'oracle') return oracle;
   return mysql;
 }
