@@ -12,6 +12,7 @@ import { SqlGuardService } from '../src/ai/sql-guard.service';
 import { EncryptionService } from '../src/common/encryption/encryption.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { createMysqlPool, buildSshConfig } from '../src/common/db/mysql-pool';
+import { normalizeEngine } from '../src/common/db/engine';
 
 const CONNECTION_NAME = 'eCommerce DB';
 
@@ -114,6 +115,7 @@ async function main() {
     schemaContext: ai.buildSchemaContext(sel2.tables),
     conversationHistory: [],
     databaseName: connection.databaseName,
+    engine: normalizeEngine(connection.engine),
   });
   console.log(`  Question: "${q2}"`);
   if (!gen2) {
@@ -140,6 +142,7 @@ async function main() {
     schemaContext: ai.buildSchemaContext(sel3.tables),
     conversationHistory: [],
     databaseName: connection.databaseName,
+    engine: normalizeEngine(connection.engine),
   });
   console.log(`  Question: "${q3}"`);
   if (!gen3) {
@@ -185,6 +188,7 @@ async function main() {
     );
     const repair = await ai.repairSQL({
       databaseName: connection.databaseName,
+    engine: normalizeEngine(connection.engine),
       schemaContext: ai.buildSchemaContext(sel4.tables),
       question: 'show order amounts',
       brokenSql,
@@ -225,6 +229,7 @@ async function main() {
     schemaContext: ai.buildSchemaContext(sel6.tables),
     conversationHistory: [],
     databaseName: connection.databaseName,
+    engine: normalizeEngine(connection.engine),
   });
   console.log(`  Question: "${q6}"`);
   if (!gen6) {

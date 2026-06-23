@@ -1,6 +1,11 @@
 import { Injectable, NotFoundException, Logger } from '@nestjs/common';
-import * as mysql from 'mysql2/promise';
-import { createMysqlPool, buildSshConfig } from '../common/db/mysql-pool';
+import {
+  createPool,
+  type SqlClient,
+  buildSshConfig,
+} from '../common/db/mysql-pool';
+import { DbEngine, normalizeEngine } from '../common/db/engine';
+import { AuditDialect, auditDialect } from './audit-dialect';
 import { PrismaService } from '../../prisma/prisma.service';
 import { EncryptionService } from '../common/encryption/encryption.service';
 import { AiOrchestratorService } from '../ai/ai-orchestrator.service';
@@ -80,10 +85,12 @@ export class SchemaAuditService {
     });
     if (!connection) throw new NotFoundException('Connection not found');
 
-    const tables = await this.introspect(connection);
+    const engine = normalizeEngine(connection.engine);
+    const dialect = auditDialect(engine);
+    const tables = await this.introspect(connection, engine);
 
     const findings: AuditFinding[] = [];
-    for (const rule of this.RULES) findings.push(...rule(tables));
+    for (const rule of this.RULES) findings.push(...rule(tables, dialect));
 
     // AI advisor — best-effort, adds higher-level suggestions.
     try {
@@ -132,6 +139,7 @@ export class SchemaAuditService {
 
   private async introspect(
     connection: {
+      engine: string;
       host: string;
       port: number;
       databaseName: string;
@@ -139,8 +147,9 @@ export class SchemaAuditService {
       encryptedPassword: string;
       sslEnabled: boolean;
     } & Parameters<typeof buildSshConfig>[0],
+    engine: DbEngine,
   ): Promise<TableModel[]> {
-    const { pool, cleanup } = await createMysqlPool({
+    const client = await createPool(engine, {
       host: connection.host,
       port: connection.port,
       database: connection.databaseName,
@@ -151,97 +160,271 @@ export class SchemaAuditService {
       connectionLimit: 3,
       connectTimeout: 10000,
     });
-    const db = connection.databaseName;
 
     try {
-      const [tableRows] = await pool.query<mysql.RowDataPacket[]>(
-        `SELECT TABLE_NAME, ENGINE, TABLE_ROWS, TABLE_COLLATION, TABLE_TYPE
-         FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?`,
-        [db],
-      );
-      const [colRows] = await pool.query<mysql.RowDataPacket[]>(
-        `SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, DATA_TYPE, IS_NULLABLE,
-                COLUMN_KEY, EXTRA, COLLATION_NAME, ORDINAL_POSITION
-         FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ?
-         ORDER BY TABLE_NAME, ORDINAL_POSITION`,
-        [db],
-      );
-      const [idxRows] = await pool.query<mysql.RowDataPacket[]>(
-        `SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME, NON_UNIQUE, SEQ_IN_INDEX
-         FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ?
-         ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX`,
-        [db],
-      );
-      const [fkRows] = await pool.query<mysql.RowDataPacket[]>(
-        `SELECT TABLE_NAME, COLUMN_NAME
-         FROM information_schema.KEY_COLUMN_USAGE
-         WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL`,
-        [db],
-      );
-
-      const tables = new Map<string, TableModel>();
-      for (const r of tableRows as Record<string, unknown>[]) {
-        const name = String(r['TABLE_NAME']);
-        tables.set(name, {
-          name,
-          engine: r['ENGINE'] ? String(r['ENGINE']) : null,
-          collation: r['TABLE_COLLATION'] ? String(r['TABLE_COLLATION']) : null,
-          rowCount: Number(r['TABLE_ROWS'] ?? 0),
-          isView: String(r['TABLE_TYPE']) === 'VIEW',
-          columns: [],
-          indexes: [],
-          pk: [],
-          fkColumns: new Set(),
-        });
-      }
-
-      for (const r of colRows as Record<string, unknown>[]) {
-        const t = tables.get(String(r['TABLE_NAME']));
-        if (!t) continue;
-        const col: ColModel = {
-          name: String(r['COLUMN_NAME']),
-          columnType: String(r['COLUMN_TYPE']),
-          dataType: String(r['DATA_TYPE']).toLowerCase(),
-          isNullable: String(r['IS_NULLABLE']).toUpperCase() === 'YES',
-          columnKey: String(r['COLUMN_KEY'] ?? ''),
-          extra: String(r['EXTRA'] ?? '').toLowerCase(),
-          collation: r['COLLATION_NAME'] ? String(r['COLLATION_NAME']) : null,
-        };
-        t.columns.push(col);
-        if (col.columnKey === 'PRI') t.pk.push(col.name);
-      }
-
-      const idxByTable = new Map<string, Map<string, IndexModel>>();
-      for (const r of idxRows as Record<string, unknown>[]) {
-        const tableName = String(r['TABLE_NAME']);
-        if (!tables.has(tableName)) continue;
-        const idxName = String(r['INDEX_NAME']);
-        let byName = idxByTable.get(tableName);
-        if (!byName) {
-          byName = new Map();
-          idxByTable.set(tableName, byName);
-        }
-        let idx = byName.get(idxName);
-        if (!idx) {
-          idx = { name: idxName, columns: [], unique: Number(r['NON_UNIQUE']) === 0 };
-          byName.set(idxName, idx);
-        }
-        idx.columns.push(String(r['COLUMN_NAME']));
-      }
-      for (const [tableName, byName] of idxByTable) {
-        const t = tables.get(tableName);
-        if (t) t.indexes = [...byName.values()];
-      }
-
-      for (const r of fkRows as Record<string, unknown>[]) {
-        const t = tables.get(String(r['TABLE_NAME']));
-        if (t) t.fkColumns.add(String(r['COLUMN_NAME']));
-      }
-
-      return [...tables.values()];
+      return engine === 'postgres'
+        ? await this.introspectPostgres(client)
+        : await this.introspectMysql(client, connection.databaseName);
     } finally {
-      await cleanup();
+      await client.cleanup();
     }
+  }
+
+  private async introspectMysql(
+    client: SqlClient,
+    db: string,
+  ): Promise<TableModel[]> {
+    const tableRows = await client.query<Record<string, unknown>>(
+      `SELECT TABLE_NAME, ENGINE, TABLE_ROWS, TABLE_COLLATION, TABLE_TYPE
+       FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?`,
+      [db],
+    );
+    const colRows = await client.query<Record<string, unknown>>(
+      `SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, DATA_TYPE, IS_NULLABLE,
+              COLUMN_KEY, EXTRA, COLLATION_NAME, ORDINAL_POSITION
+       FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ?
+       ORDER BY TABLE_NAME, ORDINAL_POSITION`,
+      [db],
+    );
+    const idxRows = await client.query<Record<string, unknown>>(
+      `SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME, NON_UNIQUE, SEQ_IN_INDEX
+       FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ?
+       ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX`,
+      [db],
+    );
+    const fkRows = await client.query<Record<string, unknown>>(
+      `SELECT TABLE_NAME, COLUMN_NAME
+       FROM information_schema.KEY_COLUMN_USAGE
+       WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL`,
+      [db],
+    );
+
+    const tables = new Map<string, TableModel>();
+    for (const r of tableRows) {
+      const name = String(r['TABLE_NAME']);
+      tables.set(name, {
+        name,
+        engine: r['ENGINE'] ? String(r['ENGINE']) : null,
+        collation: r['TABLE_COLLATION'] ? String(r['TABLE_COLLATION']) : null,
+        rowCount: Number(r['TABLE_ROWS'] ?? 0),
+        isView: String(r['TABLE_TYPE']) === 'VIEW',
+        columns: [],
+        indexes: [],
+        pk: [],
+        fkColumns: new Set(),
+      });
+    }
+
+    for (const r of colRows) {
+      const t = tables.get(String(r['TABLE_NAME']));
+      if (!t) continue;
+      const col: ColModel = {
+        name: String(r['COLUMN_NAME']),
+        columnType: String(r['COLUMN_TYPE']),
+        dataType: String(r['DATA_TYPE']).toLowerCase(),
+        isNullable: String(r['IS_NULLABLE']).toUpperCase() === 'YES',
+        columnKey: String(r['COLUMN_KEY'] ?? ''),
+        extra: String(r['EXTRA'] ?? '').toLowerCase(),
+        collation: r['COLLATION_NAME'] ? String(r['COLLATION_NAME']) : null,
+      };
+      t.columns.push(col);
+      if (col.columnKey === 'PRI') t.pk.push(col.name);
+    }
+
+    const idxByTable = new Map<string, Map<string, IndexModel>>();
+    for (const r of idxRows) {
+      const tableName = String(r['TABLE_NAME']);
+      if (!tables.has(tableName)) continue;
+      const idxName = String(r['INDEX_NAME']);
+      let byName = idxByTable.get(tableName);
+      if (!byName) {
+        byName = new Map();
+        idxByTable.set(tableName, byName);
+      }
+      let idx = byName.get(idxName);
+      if (!idx) {
+        idx = { name: idxName, columns: [], unique: Number(r['NON_UNIQUE']) === 0 };
+        byName.set(idxName, idx);
+      }
+      idx.columns.push(String(r['COLUMN_NAME']));
+    }
+    for (const [tableName, byName] of idxByTable) {
+      const t = tables.get(tableName);
+      if (t) t.indexes = [...byName.values()];
+    }
+
+    for (const r of fkRows) {
+      const t = tables.get(String(r['TABLE_NAME']));
+      if (t) t.fkColumns.add(String(r['COLUMN_NAME']));
+    }
+
+    return [...tables.values()];
+  }
+
+  /**
+   * Postgres equivalent of introspectMysql. Scoped to the `public` schema.
+   * `engine`/`collation` are left null (no MySQL storage-engine/charset notion),
+   * which naturally disables those MySQL-only rules. Postgres types are mapped to
+   * the MySQL-ish tokens the deterministic rules expect (e.g. integer -> int,
+   * double precision -> double, character varying -> varchar), and identity /
+   * serial columns are marked extra='auto_increment' so the PK rules still fire.
+   */
+  private async introspectPostgres(client: SqlClient): Promise<TableModel[]> {
+    const schema = 'public';
+    const tableRows = await client.query<Record<string, unknown>>(
+      `SELECT t.table_name AS "tableName",
+              COALESCE(st.n_live_tup, 0) AS "rowCount",
+              t.table_type AS "tableType"
+       FROM information_schema.tables t
+       LEFT JOIN pg_stat_user_tables st
+         ON st.relname = t.table_name AND st.schemaname = t.table_schema
+       WHERE t.table_schema = $1`,
+      [schema],
+    );
+    const colRows = await client.query<Record<string, unknown>>(
+      `SELECT c.table_name AS "tableName",
+              c.column_name AS "columnName",
+              c.data_type AS "dataType",
+              c.is_nullable AS "isNullable",
+              c.character_maximum_length AS "charLen",
+              c.numeric_precision AS "numPrec",
+              c.numeric_scale AS "numScale",
+              c.is_identity AS "isIdentity",
+              c.column_default AS "columnDefault"
+       FROM information_schema.columns c
+       WHERE c.table_schema = $1
+       ORDER BY c.table_name, c.ordinal_position`,
+      [schema],
+    );
+    const pkRows = await client.query<Record<string, unknown>>(
+      `SELECT kcu.table_name AS "tableName", kcu.column_name AS "columnName"
+       FROM information_schema.table_constraints tc
+       JOIN information_schema.key_column_usage kcu
+         ON kcu.constraint_name = tc.constraint_name
+        AND kcu.table_schema = tc.table_schema
+       WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1`,
+      [schema],
+    );
+    const fkRows = await client.query<Record<string, unknown>>(
+      `SELECT kcu.table_name AS "tableName", kcu.column_name AS "columnName"
+       FROM information_schema.table_constraints tc
+       JOIN information_schema.key_column_usage kcu
+         ON kcu.constraint_name = tc.constraint_name
+        AND kcu.table_schema = tc.table_schema
+       WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = $1`,
+      [schema],
+    );
+    const idxRows = await client.query<Record<string, unknown>>(
+      `SELECT t.relname AS "tableName",
+              i.relname AS "indexName",
+              ix.indisunique AS "isUnique",
+              a.attname AS "columnName",
+              k.ord AS "seq"
+       FROM pg_index ix
+       JOIN pg_class i ON i.oid = ix.indexrelid
+       JOIN pg_class t ON t.oid = ix.indrelid
+       JOIN pg_namespace n ON n.oid = t.relnamespace
+       JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+       JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+       WHERE n.nspname = $1 AND t.relkind IN ('r', 'p')
+       ORDER BY t.relname, i.relname, k.ord`,
+      [schema],
+    );
+
+    const pkSet = new Set(
+      pkRows.map((r) => `${String(r['tableName'])}.${String(r['columnName'])}`),
+    );
+
+    const tables = new Map<string, TableModel>();
+    for (const r of tableRows) {
+      const name = String(r['tableName']);
+      tables.set(name, {
+        name,
+        engine: null,
+        collation: null,
+        rowCount: Number(r['rowCount'] ?? 0),
+        isView: String(r['tableType']) === 'VIEW',
+        columns: [],
+        indexes: [],
+        pk: [],
+        fkColumns: new Set(),
+      });
+    }
+
+    for (const r of colRows) {
+      const t = tables.get(String(r['tableName']));
+      if (!t) continue;
+      const name = String(r['columnName']);
+      const dataType = this.mapPgType(String(r['dataType']));
+      const isPk = pkSet.has(`${t.name}.${name}`);
+      const isIdentity =
+        String(r['isIdentity'] ?? '').toUpperCase() === 'YES' ||
+        /nextval\(/i.test(String(r['columnDefault'] ?? ''));
+      const col: ColModel = {
+        name,
+        columnType: this.pgColumnType(dataType, r),
+        dataType,
+        isNullable: String(r['isNullable']).toUpperCase() === 'YES',
+        columnKey: isPk ? 'PRI' : '',
+        extra: isIdentity ? 'auto_increment' : '',
+        collation: null,
+      };
+      t.columns.push(col);
+      if (isPk) t.pk.push(name);
+    }
+
+    const idxByTable = new Map<string, Map<string, IndexModel>>();
+    for (const r of idxRows) {
+      const tableName = String(r['tableName']);
+      if (!tables.has(tableName)) continue;
+      const idxName = String(r['indexName']);
+      let byName = idxByTable.get(tableName);
+      if (!byName) {
+        byName = new Map();
+        idxByTable.set(tableName, byName);
+      }
+      let idx = byName.get(idxName);
+      if (!idx) {
+        idx = { name: idxName, columns: [], unique: r['isUnique'] === true };
+        byName.set(idxName, idx);
+      }
+      idx.columns.push(String(r['columnName']));
+    }
+    for (const [tableName, byName] of idxByTable) {
+      const t = tables.get(tableName);
+      if (t) t.indexes = [...byName.values()];
+    }
+
+    for (const r of fkRows) {
+      const t = tables.get(String(r['tableName']));
+      if (t) t.fkColumns.add(String(r['columnName']));
+    }
+
+    return [...tables.values()];
+  }
+
+  /** Map a Postgres data_type to the MySQL-ish token the rules check against. */
+  private mapPgType(pg: string): string {
+    const t = pg.toLowerCase();
+    if (t === 'integer') return 'int';
+    if (t === 'double precision') return 'double';
+    if (t === 'real') return 'float';
+    if (t === 'numeric' || t === 'decimal') return 'decimal';
+    if (t === 'character varying') return 'varchar';
+    if (t === 'character') return 'char';
+    return t; // bigint, smallint, text, boolean, timestamp, date, etc. pass through
+  }
+
+  /** Reconstruct a MySQL-style columnType string (e.g. varchar(255)) for pg. */
+  private pgColumnType(dataType: string, r: Record<string, unknown>): string {
+    const charLen = r['charLen'];
+    if (charLen !== null && charLen !== undefined) {
+      return `${dataType}(${Number(charLen)})`;
+    }
+    if (dataType === 'decimal' && r['numPrec'] != null) {
+      return `${dataType}(${Number(r['numPrec'])},${Number(r['numScale'] ?? 0)})`;
+    }
+    return dataType;
   }
 
   private schemaSummary(tables: TableModel[]): string {
@@ -270,9 +453,11 @@ export class SchemaAuditService {
     return t.indexes.some((i) => i.columns[0] === column);
   }
 
-  private readonly RULES: Array<(tables: TableModel[]) => AuditFinding[]> = [
+  private readonly RULES: Array<
+    (tables: TableModel[], d: AuditDialect) => AuditFinding[]
+  > = [
     // No primary key
-    (tables) =>
+    (tables, d) =>
       tables
         .filter((t) => !t.isView && t.pk.length === 0)
         .map((t) => ({
@@ -281,13 +466,13 @@ export class SchemaAuditService {
           category: 'Structure',
           title: 'Table has no primary key',
           table: t.name,
-          detail: `"${t.name}" has no primary key. PKs are required for replication, reliable updates and InnoDB clustering.`,
-          recommendation: 'Add a primary key (e.g. an AUTO_INCREMENT id).',
-          fixSql: `ALTER TABLE \`${t.name}\` ADD COLUMN \`id\` BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST;`,
+          detail: `"${t.name}" has no primary key. PKs are required for replication, reliable updates and efficient clustering.`,
+          recommendation: 'Add a primary key (e.g. an auto-incrementing id).',
+          fixSql: d.addIdPk(t.name),
         })),
 
     // Implicit FK: *_id column referencing an existing table, but no FK constraint
-    (tables) => {
+    (tables, d) => {
       const names = new Set(tables.map((t) => t.name.toLowerCase()));
       const out: AuditFinding[] = [];
       for (const t of tables) {
@@ -307,7 +492,7 @@ export class SchemaAuditService {
               column: c.name,
               detail: `"${t.name}.${c.name}" looks like it references "${target}" but has no FK constraint, so referential integrity isn't enforced.`,
               recommendation: `Add a foreign key from ${t.name}.${c.name} to ${target}.`,
-              fixSql: `ALTER TABLE \`${t.name}\` ADD CONSTRAINT \`fk_${t.name}_${c.name}\` FOREIGN KEY (\`${c.name}\`) REFERENCES \`${target}\`(\`id\`);`,
+              fixSql: d.addForeignKey(t.name, c.name, target),
             });
           }
         }
@@ -316,7 +501,7 @@ export class SchemaAuditService {
     },
 
     // *_id columns not indexed (slow joins/filters)
-    (tables) => {
+    (tables, d) => {
       const out: AuditFinding[] = [];
       for (const t of tables) {
         if (t.isView) continue;
@@ -332,7 +517,7 @@ export class SchemaAuditService {
               column: c.name,
               detail: `"${t.name}.${c.name}" is commonly used for joins/filters but has no index — this causes full table scans.`,
               recommendation: `Add an index on ${t.name}.${c.name}.`,
-              fixSql: `CREATE INDEX \`idx_${t.name}_${c.name}\` ON \`${t.name}\`(\`${c.name}\`);`,
+              fixSql: d.createIndex(t.name, c.name),
             });
           }
         }
@@ -364,7 +549,7 @@ export class SchemaAuditService {
     },
 
     // Missing audit timestamps
-    (tables) =>
+    (tables, d) =>
       tables
         .filter((t) => !t.isView)
         .filter((t) => {
@@ -381,11 +566,11 @@ export class SchemaAuditService {
           table: t.name,
           detail: `"${t.name}" is missing created_at/updated_at columns, making it hard to audit changes.`,
           recommendation: 'Add created_at and updated_at TIMESTAMP columns.',
-          fixSql: `ALTER TABLE \`${t.name}\`\n  ADD COLUMN \`created_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n  ADD COLUMN \`updated_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;`,
+          fixSql: d.addTimestamps(t.name),
         })),
 
     // Money stored as float/double
-    (tables) => {
+    (tables, d) => {
       const out: AuditFinding[] = [];
       const money = /(price|amount|cost|total|balance|salary|fee|payment|revenue|subtotal)/i;
       for (const t of tables) {
@@ -400,7 +585,7 @@ export class SchemaAuditService {
               column: c.name,
               detail: `"${t.name}.${c.name}" stores money as ${c.dataType.toUpperCase()}, which is lossy and causes rounding errors.`,
               recommendation: 'Use DECIMAL(precision, scale) for money.',
-              fixSql: `ALTER TABLE \`${t.name}\` MODIFY \`${c.name}\` DECIMAL(12,2);`,
+              fixSql: d.setColumnDecimal(t.name, c.name),
             });
           }
         }
@@ -409,7 +594,7 @@ export class SchemaAuditService {
     },
 
     // Boolean-ish column stored as string
-    (tables) => {
+    (tables, d) => {
       const out: AuditFinding[] = [];
       for (const t of tables) {
         for (const c of t.columns) {
@@ -422,8 +607,8 @@ export class SchemaAuditService {
               table: t.name,
               column: c.name,
               detail: `"${t.name}.${c.name}" looks boolean but is ${c.dataType.toUpperCase()}.`,
-              recommendation: 'Use TINYINT(1)/BOOLEAN for flags.',
-              fixSql: `ALTER TABLE \`${t.name}\` MODIFY \`${c.name}\` TINYINT(1) NOT NULL DEFAULT 0;`,
+              recommendation: `Use ${d.booleanTypeLabel} for flags.`,
+              fixSql: d.setColumnBoolean(t.name, c.name),
             });
           }
         }
@@ -451,9 +636,10 @@ export class SchemaAuditService {
         }));
     },
 
-    // Non-InnoDB engine
-    (tables) =>
-      tables
+    // Non-InnoDB engine (MySQL only)
+    (tables, d) => {
+      if (!d.hasStorageEngines) return [];
+      return tables
         .filter((t) => !t.isView && t.engine && t.engine.toLowerCase() !== 'innodb')
         .map((t) => ({
           id: `engine:${t.name}`,
@@ -464,11 +650,13 @@ export class SchemaAuditService {
           detail: `"${t.name}" uses ${t.engine}, which lacks transactions and foreign keys.`,
           recommendation: 'Convert to InnoDB.',
           fixSql: `ALTER TABLE \`${t.name}\` ENGINE=InnoDB;`,
-        })),
+        }));
+    },
 
-    // Non-utf8mb4 collation
-    (tables) =>
-      tables
+    // Non-utf8mb4 collation (MySQL only)
+    (tables, d) => {
+      if (!d.hasCharsets) return [];
+      return tables
         .filter((t) => !t.isView && t.collation && !t.collation.startsWith('utf8mb4'))
         .map((t) => ({
           id: `charset:${t.name}`,
@@ -479,10 +667,11 @@ export class SchemaAuditService {
           detail: `"${t.name}" uses ${t.collation}; non-utf8mb4 can't store emoji/4-byte unicode and may corrupt data.`,
           recommendation: 'Convert the table to utf8mb4.',
           fixSql: `ALTER TABLE \`${t.name}\` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`,
-        })),
+        }));
+    },
 
     // INT auto-increment PK overflow risk
-    (tables) => {
+    (tables, d) => {
       const out: AuditFinding[] = [];
       for (const t of tables) {
         if (t.isView) continue;
@@ -500,7 +689,7 @@ export class SchemaAuditService {
             column: idCol.name,
             detail: `"${t.name}.${idCol.name}" is a signed INT (max ~2.1B)${large ? ` and the table already has ~${t.rowCount.toLocaleString()} rows` : ''}.`,
             recommendation: 'Use BIGINT for primary keys to avoid future overflow.',
-            fixSql: `ALTER TABLE \`${t.name}\` MODIFY \`${idCol.name}\` BIGINT NOT NULL AUTO_INCREMENT;`,
+            fixSql: d.widenPkToBigint(t.name, idCol.name),
           });
         }
       }
@@ -557,7 +746,7 @@ export class SchemaAuditService {
     },
 
     // Natural key without a unique index
-    (tables) => {
+    (tables, d) => {
       const out: AuditFinding[] = [];
       const natural = new Set(['email', 'username', 'slug', 'sku', 'code']);
       for (const t of tables) {
@@ -577,7 +766,7 @@ export class SchemaAuditService {
               column: c.name,
               detail: `"${t.name}.${c.name}" should usually be unique but has no unique index, allowing duplicates.`,
               recommendation: `Add a unique index on ${t.name}.${c.name}.`,
-              fixSql: `CREATE UNIQUE INDEX \`uq_${t.name}_${c.name}\` ON \`${t.name}\`(\`${c.name}\`);`,
+              fixSql: d.createUniqueIndex(t.name, c.name),
             });
           }
         }

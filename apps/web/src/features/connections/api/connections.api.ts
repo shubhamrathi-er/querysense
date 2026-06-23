@@ -2,6 +2,7 @@ import { apiClient } from '@/lib/api-client';
 import type {
   Connection,
   ConnectionWithSchema,
+  DatabaseEngine,
   SchemaTable,
   SchemaModule,
   AuditReport,
@@ -14,6 +15,7 @@ interface ApiResponse<T> {
 }
 
 interface ConnectionInput extends SshConnectionInput {
+  engine: DatabaseEngine;
   host: string;
   port: number;
   databaseName: string;

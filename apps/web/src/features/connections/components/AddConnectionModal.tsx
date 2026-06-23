@@ -15,9 +15,12 @@ import { useCreateConnection } from '../hooks/useConnections';
 import { useWorkspaceStore } from '@/stores/workspace.store';
 import type { SshConnectionInput } from '../types';
 
+const ENGINE_PORTS = { mysql: 3306, postgres: 5432 } as const;
+
 const schema = z
     .object({
         name: z.string().min(2, 'Name must be at least 2 characters'),
+        engine: z.enum(['mysql', 'postgres']),
         host: z.string().min(1, 'Host is required'),
         port: z.number().min(1).max(65535),
         databaseName: z.string().min(1, 'Database name is required'),
@@ -125,6 +128,7 @@ export function AddConnectionModal({ onClose }: Props) {
     } = useForm<FormData>({
         resolver: zodResolver(schema) as Resolver<FormData>,
         defaultValues: {
+            engine: 'mysql',
             port: 3306,
             sslEnabled: false,
             sshEnabled: false,
@@ -135,6 +139,17 @@ export function AddConnectionModal({ onClose }: Props) {
 
     const sshEnabled = watch('sshEnabled');
     const sshAuthMethod = watch('sshAuthMethod') ?? 'key';
+    const engine = watch('engine') ?? 'mysql';
+
+    // Switch the engine, and move the port to the new engine's default if it was
+    // still on the previous engine's default (don't clobber a custom port).
+    const handleEngineChange = (next: 'mysql' | 'postgres') => {
+        const current = getValues('port');
+        if (current === ENGINE_PORTS[engine]) {
+            setValue('port', ENGINE_PORTS[next]);
+        }
+        setValue('engine', next);
+    };
 
     const handleTest = async () => {
         const values = getValues();
@@ -147,6 +162,7 @@ export function AddConnectionModal({ onClose }: Props) {
             const result = await connectionsApi.testNew(
                 currentWorkspace?.id ?? '',
                 {
+                    engine: values.engine,
                     host: values.host,
                     port: values.port,
                     databaseName: values.databaseName,
@@ -167,6 +183,7 @@ export function AddConnectionModal({ onClose }: Props) {
     const onSubmit = async (data: FormData) => {
         await createConnection.mutateAsync({
             name: data.name,
+            engine: data.engine,
             host: data.host,
             port: data.port,
             databaseName: data.databaseName,
@@ -196,7 +213,7 @@ export function AddConnectionModal({ onClose }: Props) {
                         </div>
                         <div>
                             <h2 className="font-semibold">Add Database Connection</h2>
-                            <p className="text-xs text-muted-foreground">Connect a MySQL database</p>
+                            <p className="text-xs text-muted-foreground">Connect a MySQL or PostgreSQL database</p>
                         </div>
                     </div>
                     <button
@@ -209,6 +226,31 @@ export function AddConnectionModal({ onClose }: Props) {
 
                 {/* Form */}
                 <form onSubmit={handleSubmit(onSubmit)} className="p-6 space-y-4 overflow-y-auto">
+                    {/* Database engine */}
+                    <div>
+                        <label className="block text-sm font-medium mb-1.5">Database Engine</label>
+                        <div className="flex gap-2">
+                            {([
+                                { value: 'mysql', label: 'MySQL' },
+                                { value: 'postgres', label: 'PostgreSQL' },
+                            ] as const).map((opt) => (
+                                <button
+                                    key={opt.value}
+                                    type="button"
+                                    onClick={() => handleEngineChange(opt.value)}
+                                    className={cn(
+                                        'flex-1 py-1.5 px-3 rounded-lg text-xs font-medium border transition-colors',
+                                        engine === opt.value
+                                            ? 'bg-primary text-primary-foreground border-primary'
+                                            : 'border-border hover:bg-accent',
+                                    )}
+                                >
+                                    {opt.label}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+
                     {/* Connection Name */}
                     <div>
                         <label className="block text-sm font-medium mb-1.5">
@@ -252,7 +294,7 @@ export function AddConnectionModal({ onClose }: Props) {
                             <input
                                 {...register('port', { valueAsNumber: true })}
                                 type="number"
-                                placeholder="3306"
+                                placeholder={String(ENGINE_PORTS[engine])}
                                 className={cn(
                                     'w-full px-3 py-2 bg-input border rounded-lg text-sm',
                                     'focus:outline-none focus:ring-2 focus:ring-primary/50',

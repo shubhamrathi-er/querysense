@@ -19,6 +19,18 @@ describe('SqlValidatorService.validate (fail-closed)', () => {
     expect(res.valid).toBe(false);
     expect(res.riskLevel).toBe('HIGH');
   });
+
+  it('validates Postgres-dialect SELECT with the postgres parser', () => {
+    // Double-quoted identifiers + ILIKE are valid Postgres but not MySQL.
+    const sql = 'SELECT "Id" FROM "Users" WHERE name ILIKE \'%a%\'';
+    expect(validator.validate(sql, 'postgres').valid).toBe(true);
+  });
+
+  it('still rejects forbidden ops under the postgres dialect', () => {
+    expect(validator.validate('DELETE FROM users', 'postgres').valid).toBe(
+      false,
+    );
+  });
 });
 
 describe('SqlValidatorService structured output', () => {

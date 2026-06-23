@@ -1,6 +1,9 @@
+export type DatabaseEngine = 'mysql' | 'postgres';
+
 export interface Connection {
   id: string;
   name: string;
+  engine: DatabaseEngine;
   host: string;
   port: number;
   databaseName: string;

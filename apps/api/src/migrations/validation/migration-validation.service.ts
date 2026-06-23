@@ -2,7 +2,9 @@ import { Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { EncryptionService } from '../../common/encryption/encryption.service';
 import { MysqlAdapter } from './dialect/mysql.adapter';
+import { PostgresAdapter } from './dialect/postgres.adapter';
 import { buildSshConfig } from '../../common/db/mysql-pool';
+import { normalizeEngine } from '../../common/db/engine';
 import type { DialectAdapter, FkDetail } from './dialect/dialect-adapter.interface';
 import {
   Severity,
@@ -488,8 +490,7 @@ export class MigrationValidationService {
       where: { id: connectionId, workspaceId },
     });
     if (!c) throw new NotFoundException('Connection not found');
-    // Strategy selection point — MySQL today; switch on engine for others.
-    return new MysqlAdapter({
+    const cfg = {
       host: c.host,
       port: c.port,
       database: c.databaseName,
@@ -497,7 +498,10 @@ export class MigrationValidationService {
       password: this.encryption.decrypt(c.encryptedPassword),
       sslEnabled: c.sslEnabled,
       ssh: buildSshConfig(c, (s) => this.encryption.decrypt(s)),
-    });
+    };
+    return normalizeEngine(c.engine) === 'postgres'
+      ? new PostgresAdapter(cfg)
+      : new MysqlAdapter(cfg);
   }
 }
 

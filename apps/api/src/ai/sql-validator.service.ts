@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Parser } from 'node-sql-parser';
+import { DbEngine, parserDialect } from '../common/db/engine';
 
 export interface ValidationResult {
   valid: boolean;
@@ -34,7 +35,7 @@ export class SqlValidatorService {
     'LOAD_FILE',
   ];
 
-  validate(sql: string): ValidationResult {
+  validate(sql: string, engine: DbEngine = 'mysql'): ValidationResult {
     const trimmed = sql.trim();
     const normalized = trimmed.toUpperCase();
 
@@ -61,7 +62,9 @@ export class SqlValidatorService {
 
     // 3. AST parsing — catches obfuscated injections
     try {
-      const ast = this.parser.astify(trimmed, { database: 'MySQL' });
+      const ast = this.parser.astify(trimmed, {
+        database: parserDialect(engine),
+      });
       const statements = Array.isArray(ast) ? ast : [ast];
 
       // Multiple statements = injection attempt
@@ -131,9 +134,12 @@ export class SqlValidatorService {
   }
 
   /** Tables and columns a query reads, derived from the parsed AST. */
-  extractAccessed(sql: string): { tables: string[]; columns: string[] } {
+  extractAccessed(
+    sql: string,
+    engine: DbEngine = 'mysql',
+  ): { tables: string[]; columns: string[] } {
     try {
-      const opt = { database: 'MySQL' };
+      const opt = { database: parserDialect(engine) };
       // tableList → "select::dbName::tableName"; columnList → "select::table::col"
       const tables = [
         ...new Set(
@@ -173,7 +179,10 @@ export class SqlValidatorService {
    * interpretations (only options whose SQL passes validation are kept), or
    * `{ is: false }` if the response isn't a valid clarification with ≥2 options.
    */
-  parseClarification(aiResponse: string): {
+  parseClarification(
+    aiResponse: string,
+    engine: DbEngine = 'mysql',
+  ): {
     is: boolean;
     clarify?: string;
     options?: Array<{ label: string; sql: string }>;
@@ -200,7 +209,7 @@ export class SqlValidatorService {
       const o = opt as { label?: unknown; sql?: unknown };
       if (typeof o.label !== 'string' || typeof o.sql !== 'string') continue;
       const sql = this.extractSQL(o.sql) ?? o.sql.trim();
-      if (!this.validate(sql).valid) continue;
+      if (!this.validate(sql, engine).valid) continue;
       options.push({ label: o.label.trim(), sql });
     }
 

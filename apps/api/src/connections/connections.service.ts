@@ -4,13 +4,17 @@ import {
   BadRequestException,
   Logger,
 } from '@nestjs/common';
-import * as mysql from 'mysql2/promise';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { EncryptionService } from '../common/encryption/encryption.service';
 import { AiOrchestratorService } from '../ai/ai-orchestrator.service';
 import { SchemaDiscoveryService } from './schema-discovery.service';
-import { createMysqlPool, buildSshConfig } from '../common/db/mysql-pool';
+import { createPool, buildSshConfig } from '../common/db/mysql-pool';
+import {
+  DEFAULT_PORTS,
+  normalizeEngine,
+  quoteIdent,
+} from '../common/db/engine';
 import { CreateConnectionDto } from './dto/create-connection.dto';
 import { UpdateConnectionDto } from './dto/update-connection.dto';
 import { TestConnectionDto } from './dto/test-connection.dto';
@@ -53,6 +57,7 @@ export class ConnectionsService {
   private readonly publicSelect = {
     id: true,
     name: true,
+    engine: true,
     host: true,
     port: true,
     databaseName: true,
@@ -123,13 +128,15 @@ export class ConnectionsService {
 
   async create(workspaceId: string, dto: CreateConnectionDto) {
     const encryptedPassword = this.encryption.encrypt(dto.password);
+    const engine = normalizeEngine(dto.engine);
 
     return this.prisma.databaseConnection.create({
       data: {
         workspaceId,
         name: dto.name,
+        engine,
         host: dto.host,
-        port: dto.port,
+        port: dto.port ?? DEFAULT_PORTS[engine],
         databaseName: dto.databaseName,
         username: dto.username,
         encryptedPassword,
@@ -176,9 +183,11 @@ export class ConnectionsService {
   }
 
   async testConnection(dto: TestConnectionDto) {
+    const engine = normalizeEngine(dto.engine);
     return this.schemaDiscovery.testConnection({
+      engine,
       host: dto.host,
-      port: dto.port,
+      port: dto.port ?? DEFAULT_PORTS[engine],
       databaseName: dto.databaseName,
       username: dto.username,
       password: dto.password,
@@ -202,6 +211,7 @@ export class ConnectionsService {
     const password = this.encryption.decrypt(connection.encryptedPassword);
 
     const result = await this.schemaDiscovery.testConnection({
+      engine: connection.engine,
       host: connection.host,
       port: connection.port,
       databaseName: connection.databaseName,
@@ -230,6 +240,7 @@ export class ConnectionsService {
     this.logger.log(`Starting schema sync for connection: ${connection.name}`);
 
     const tables = await this.schemaDiscovery.discoverSchema({
+      engine: connection.engine,
       host: connection.host,
       port: connection.port,
       databaseName: connection.databaseName,
@@ -599,6 +610,7 @@ export class ConnectionsService {
   /** Pull up to 5 distinct short sample values per column from the live table. */
   private async fetchSampleValues(
     connection: Parameters<typeof buildSshConfig>[0] & {
+      engine: string;
       host: string;
       port: number;
       databaseName: string;
@@ -611,7 +623,8 @@ export class ConnectionsService {
   ): Promise<Record<string, string[]>> {
     if (!/^[A-Za-z0-9_$]+$/.test(tableName)) return {};
 
-    const { pool, cleanup } = await createMysqlPool({
+    const engine = normalizeEngine(connection.engine);
+    const client = await createPool(engine, {
       host: connection.host,
       port: connection.port,
       database: connection.databaseName,
@@ -624,8 +637,8 @@ export class ConnectionsService {
     });
 
     try {
-      const [rows] = await pool.query<mysql.RowDataPacket[]>(
-        `SELECT * FROM \`${tableName}\` LIMIT 20`,
+      const rows = await client.query<Record<string, unknown>>(
+        `SELECT * FROM ${quoteIdent(engine, tableName)} LIMIT 20`,
       );
       const sets: Record<string, Set<string>> = {};
       for (const name of columnNames) sets[name] = new Set();
@@ -644,7 +657,7 @@ export class ConnectionsService {
       for (const name of columnNames) out[name] = [...sets[name]];
       return out;
     } finally {
-      await cleanup();
+      await client.cleanup();
     }
   }
 

@@ -11,6 +11,7 @@ import {
   buildSshConfig,
   type SshConfig,
 } from '../common/db/mysql-pool';
+import { DbEngine, normalizeEngine } from '../common/db/engine';
 import { PrismaService } from '../../prisma/prisma.service';
 import { EncryptionService } from '../common/encryption/encryption.service';
 import { MigrationValidationService } from './validation/migration-validation.service';
@@ -18,6 +19,7 @@ import { MigrationValidationService } from './validation/migration-validation.se
 type Conflict = 'skip' | 'truncate' | 'upsert';
 
 interface ConnInfo {
+  engine: DbEngine;
   host: string;
   port: number;
   databaseName: string;
@@ -55,6 +57,7 @@ export class DataMigrationService {
     }
     const source = await this.load(sourceId, workspaceId);
     const target = await this.load(targetId, workspaceId);
+    this.assertMysql(source, target);
     const { pool: sPool, cleanup: sCleanup } = await this.pool(source);
     const { pool: tPool, cleanup: tCleanup } = await this.pool(target);
 
@@ -103,6 +106,8 @@ export class DataMigrationService {
     },
   ): Promise<{ sql: string; truncated: boolean; rowsIncluded: number }> {
     const source = await this.load(dto.sourceConnectionId, workspaceId);
+    const target = await this.load(dto.targetConnectionId, workspaceId);
+    this.assertMysql(source, target);
     const { pool: sPool, cleanup: sCleanup } = await this.pool(source);
     const conn = await sPool.getConnection();
     try {
@@ -235,6 +240,7 @@ export class DataMigrationService {
       }
       const source = await this.load(dto.sourceConnectionId, workspaceId);
       target = await this.load(dto.targetConnectionId, workspaceId);
+      this.assertMysql(source, target);
       ({ pool: sPool, cleanup: sCleanup } = await this.pool(source));
       ({ pool: tPool, cleanup: tCleanup } = await this.pool(target));
       tConn = await tPool.getConnection();
@@ -535,6 +541,7 @@ export class DataMigrationService {
     });
     if (!c) throw new NotFoundException('Connection not found');
     return {
+      engine: normalizeEngine(c.engine),
       host: c.host,
       port: c.port,
       databaseName: c.databaseName,
@@ -544,6 +551,23 @@ export class DataMigrationService {
       name: c.name,
       ssh: buildSshConfig(c, (s) => this.encryption.decrypt(s)),
     };
+  }
+
+  /**
+   * Bulk data copy / script generation is MySQL-only for now (it relies on
+   * SHOW CREATE TABLE, INSERT IGNORE / ON DUPLICATE KEY UPDATE and FK-check
+   * toggling). PostgreSQL connections can still be schema-discovered, queried
+   * and migration-*validated* — just not used as a copy source/target yet.
+   */
+  private assertMysql(...conns: ConnInfo[]) {
+    for (const c of conns) {
+      if (c.engine !== 'mysql') {
+        throw new BadRequestException(
+          `Data migration currently supports MySQL only. "${c.name}" is a ` +
+            `PostgreSQL connection — it can be validated but not yet migrated.`,
+        );
+      }
+    }
   }
 
   private pool(c: ConnInfo) {

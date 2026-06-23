@@ -1,0 +1,78 @@
+import { DbEngine, quoteIdent } from '../common/db/engine';
+
+/**
+ * Per-engine fix-SQL templates and capability flags for the schema auditor.
+ * Keeps the deterministic rules in schema-audit.service.ts dialect-agnostic:
+ * they call these builders instead of hand-writing backtick MySQL DDL.
+ */
+export interface AuditDialect {
+  readonly engine: DbEngine;
+  q(name: string): string;
+  addIdPk(table: string): string;
+  addForeignKey(table: string, col: string, refTable: string): string;
+  createIndex(table: string, col: string): string;
+  createUniqueIndex(table: string, col: string): string;
+  addTimestamps(table: string): string;
+  setColumnDecimal(table: string, col: string): string;
+  setColumnBoolean(table: string, col: string): string;
+  widenPkToBigint(table: string, col: string): string;
+  /** Label used in the boolean-as-string recommendation text. */
+  readonly booleanTypeLabel: string;
+  /** Storage-engine (InnoDB) rule only applies to MySQL. */
+  readonly hasStorageEngines: boolean;
+  /** Per-table charset/collation rule only applies to MySQL. */
+  readonly hasCharsets: boolean;
+}
+
+const mysqlDialect: AuditDialect = {
+  engine: 'mysql',
+  q: (n) => quoteIdent('mysql', n),
+  addIdPk: (t) =>
+    `ALTER TABLE ${quoteIdent('mysql', t)} ADD COLUMN \`id\` BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST;`,
+  addForeignKey: (t, c, ref) =>
+    `ALTER TABLE ${quoteIdent('mysql', t)} ADD CONSTRAINT \`fk_${t}_${c}\` FOREIGN KEY (${quoteIdent('mysql', c)}) REFERENCES ${quoteIdent('mysql', ref)}(\`id\`);`,
+  createIndex: (t, c) =>
+    `CREATE INDEX \`idx_${t}_${c}\` ON ${quoteIdent('mysql', t)}(${quoteIdent('mysql', c)});`,
+  createUniqueIndex: (t, c) =>
+    `CREATE UNIQUE INDEX \`uq_${t}_${c}\` ON ${quoteIdent('mysql', t)}(${quoteIdent('mysql', c)});`,
+  addTimestamps: (t) =>
+    `ALTER TABLE ${quoteIdent('mysql', t)}\n  ADD COLUMN \`created_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n  ADD COLUMN \`updated_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;`,
+  setColumnDecimal: (t, c) =>
+    `ALTER TABLE ${quoteIdent('mysql', t)} MODIFY ${quoteIdent('mysql', c)} DECIMAL(12,2);`,
+  setColumnBoolean: (t, c) =>
+    `ALTER TABLE ${quoteIdent('mysql', t)} MODIFY ${quoteIdent('mysql', c)} TINYINT(1) NOT NULL DEFAULT 0;`,
+  widenPkToBigint: (t, c) =>
+    `ALTER TABLE ${quoteIdent('mysql', t)} MODIFY ${quoteIdent('mysql', c)} BIGINT NOT NULL AUTO_INCREMENT;`,
+  booleanTypeLabel: 'TINYINT(1)/BOOLEAN',
+  hasStorageEngines: true,
+  hasCharsets: true,
+};
+
+const postgresDialect: AuditDialect = {
+  engine: 'postgres',
+  q: (n) => quoteIdent('postgres', n),
+  addIdPk: (t) =>
+    `ALTER TABLE ${quoteIdent('postgres', t)} ADD COLUMN "id" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY;`,
+  addForeignKey: (t, c, ref) =>
+    `ALTER TABLE ${quoteIdent('postgres', t)} ADD CONSTRAINT "fk_${t}_${c}" FOREIGN KEY (${quoteIdent('postgres', c)}) REFERENCES ${quoteIdent('postgres', ref)}("id");`,
+  createIndex: (t, c) =>
+    `CREATE INDEX "idx_${t}_${c}" ON ${quoteIdent('postgres', t)}(${quoteIdent('postgres', c)});`,
+  createUniqueIndex: (t, c) =>
+    `CREATE UNIQUE INDEX "uq_${t}_${c}" ON ${quoteIdent('postgres', t)}(${quoteIdent('postgres', c)});`,
+  // Postgres has no ON UPDATE clause; updated_at maintenance needs a trigger.
+  addTimestamps: (t) =>
+    `ALTER TABLE ${quoteIdent('postgres', t)}\n  ADD COLUMN "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n  ADD COLUMN "updated_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP;`,
+  setColumnDecimal: (t, c) =>
+    `ALTER TABLE ${quoteIdent('postgres', t)} ALTER COLUMN ${quoteIdent('postgres', c)} TYPE DECIMAL(12,2);`,
+  setColumnBoolean: (t, c) =>
+    `ALTER TABLE ${quoteIdent('postgres', t)} ALTER COLUMN ${quoteIdent('postgres', c)} TYPE BOOLEAN USING (${quoteIdent('postgres', c)}::boolean);`,
+  widenPkToBigint: (t, c) =>
+    `ALTER TABLE ${quoteIdent('postgres', t)} ALTER COLUMN ${quoteIdent('postgres', c)} TYPE BIGINT;`,
+  booleanTypeLabel: 'BOOLEAN',
+  hasStorageEngines: false,
+  hasCharsets: false,
+};
+
+export function auditDialect(engine: DbEngine): AuditDialect {
+  return engine === 'postgres' ? postgresDialect : mysqlDialect;
+}

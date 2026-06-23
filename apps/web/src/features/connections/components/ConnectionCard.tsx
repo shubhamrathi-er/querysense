@@ -7,7 +7,7 @@ import {
   RefreshCw, Trash2, CheckCircle2, Clock, Loader2,
   Table2, Network, MoreVertical,
 } from 'lucide-react';
-import { SiMysql } from 'react-icons/si';
+import { SiMysql, SiPostgresql } from 'react-icons/si';
 import { cn, timeAgo } from '@/lib/utils';
 import { StatusDot, statusTone } from '@/components/ui/status-dot';
 import {
@@ -94,7 +94,11 @@ export function ConnectionCard({ connection, index = 0 }: Props) {
       <div className="flex items-start gap-3 p-4">
         {/* logo */}
         <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-border bg-white">
-          <SiMysql className="h-7 w-7" style={{ color: '#00758F' }} />
+          {connection.engine === 'postgres' ? (
+            <SiPostgresql className="h-7 w-7" style={{ color: '#336791' }} />
+          ) : (
+            <SiMysql className="h-7 w-7" style={{ color: '#00758F' }} />
+          )}
         </div>
 
         {/* info */}
@@ -106,7 +110,9 @@ export function ConnectionCard({ connection, index = 0 }: Props) {
             </h3>
           </div>
           <p className="mt-0.5 truncate text-sm text-muted-foreground">
-            <span className="font-medium text-foreground/70">MySQL</span>
+            <span className="font-medium text-foreground/70">
+              {connection.engine === 'postgres' ? 'PostgreSQL' : 'MySQL'}
+            </span>
             {'  ·  '}
             {connection.host}:{connection.port}/{connection.databaseName}
           </p>

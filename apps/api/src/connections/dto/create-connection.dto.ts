@@ -3,12 +3,15 @@ import {
   IsInt,
   IsBoolean,
   IsOptional,
+  IsIn,
   MinLength,
   MaxLength,
   Min,
   Max,
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
+import { DB_ENGINES } from '../../common/db/engine';
+import type { DbEngine } from '../../common/db/engine';
 
 export class CreateConnectionDto {
   @ApiProperty({ example: 'Production DB' })
@@ -17,15 +20,30 @@ export class CreateConnectionDto {
   @MaxLength(50)
   name!: string;
 
+  @ApiProperty({
+    enum: DB_ENGINES,
+    default: 'mysql',
+    required: false,
+    description: 'Target database engine',
+  })
+  @IsOptional()
+  @IsIn(DB_ENGINES)
+  engine?: DbEngine;
+
   @ApiProperty({ example: 'localhost' })
   @IsString()
   host!: string;
 
-  @ApiProperty({ example: 3306 })
+  @ApiProperty({
+    required: false,
+    example: 3306,
+    description: 'Defaults to the engine standard port (3306 mysql / 5432 postgres)',
+  })
+  @IsOptional()
   @IsInt()
   @Min(1)
   @Max(65535)
-  port!: number;
+  port?: number;
 
   @ApiProperty({ example: 'myapp_db' })
   @IsString()

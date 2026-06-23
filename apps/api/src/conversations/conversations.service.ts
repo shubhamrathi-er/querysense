@@ -7,7 +7,12 @@ import {
 } from '@nestjs/common';
 import * as mysql from 'mysql2/promise';
 import { Prisma } from '@prisma/client';
-import { createMysqlPool, buildSshConfig } from '../common/db/mysql-pool';
+import {
+  createMysqlPool,
+  createPostgresPool,
+  buildSshConfig,
+} from '../common/db/mysql-pool';
+import { DbEngine, normalizeEngine } from '../common/db/engine';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AiOrchestratorService } from '../ai/ai-orchestrator.service';
 import { SqlValidatorService } from '../ai/sql-validator.service';
@@ -251,6 +256,7 @@ export class ConversationsService {
         schemaContext,
         conversationHistory,
         databaseName: connection.databaseName,
+        engine: normalizeEngine(connection.engine),
         fewShotExamples,
       });
 
@@ -389,8 +395,14 @@ export class ConversationsService {
   ) {
     await this.assertExists(conversationId, workspaceId);
 
+    const connection = await this.prisma.databaseConnection.findFirst({
+      where: { id: dto.connectionId, workspaceId },
+    });
+    if (!connection) throw new NotFoundException('Connection not found');
+    const engine = normalizeEngine(connection.engine);
+
     // Guardrail 1 — syntax + SELECT-only safety (validate before execution).
-    const validation = this.validator.validate(dto.sql);
+    const validation = this.validator.validate(dto.sql, engine);
     if (!validation.valid) {
       this.guard.logBlocked('execute:syntax', validation.error ?? 'invalid', dto.sql);
       throw new ForbiddenException(
@@ -399,17 +411,12 @@ export class ConversationsService {
     }
 
     // Guardrail 2 — structural limits (deeply nested subqueries).
-    const structure = this.guard.checkStructure(dto.sql);
+    const structure = this.guard.checkStructure(dto.sql, engine);
     if (!structure.allowed) {
       this.guard.logBlocked('execute:structure', structure.reason ?? '', dto.sql);
       await this.recordBlocked(messageId, dto.connectionId, dto.sql, structure.reason ?? 'Blocked');
       throw new ForbiddenException(structure.reason);
     }
-
-    const connection = await this.prisma.databaseConnection.findFirst({
-      where: { id: dto.connectionId, workspaceId },
-    });
-    if (!connection) throw new NotFoundException('Connection not found');
 
     const page = dto.page ?? 1;
     // Guardrail 3 — enforce a hard row cap regardless of requested page size.
@@ -606,8 +613,10 @@ export class ConversationsService {
       );
       const schemaContext = this.ai.buildSchemaContext(selection.tables);
 
+      const engine = normalizeEngine(full.engine);
       const repair = await this.ai.repairSQL({
         databaseName: full.databaseName,
+        engine,
         schemaContext,
         question,
         brokenSql,
@@ -618,7 +627,7 @@ export class ConversationsService {
       const fixedSql = repair.sql.trim();
       // No point retrying an identical query.
       if (fixedSql === brokenSql.trim()) return null;
-      if (!this.validator.validate(fixedSql).valid) return null;
+      if (!this.validator.validate(fixedSql, engine).valid) return null;
 
       const result = await this.executePaginated(
         connection,
@@ -697,12 +706,9 @@ export class ConversationsService {
       );
     }
 
-    const validation = this.validator.validate(chosen.sql);
-    if (!validation.valid) {
-      throw new ForbiddenException(
-        `SQL validation failed: ${validation.error}`,
-      );
-    }
+    // No re-validation here: `chosen` is one of the stored interpretations, each
+    // of which was already safety-validated (with the connection's dialect) when
+    // generated. The execute path re-validates with the engine before running.
 
     return this.prisma.message.update({
       where: { id: messageId },
@@ -815,6 +821,7 @@ export class ConversationsService {
 
   private async executePaginated(
     connection: Parameters<typeof buildSshConfig>[0] & {
+      engine?: string;
       host: string;
       port: number;
       databaseName: string;
@@ -827,7 +834,8 @@ export class ConversationsService {
     pageSize: number,
     offset: number,
   ) {
-    const { pool, cleanup } = await createMysqlPool({
+    const engine = normalizeEngine(connection.engine);
+    const poolCfg = {
       host: connection.host,
       port: connection.port,
       database: connection.databaseName,
@@ -837,8 +845,20 @@ export class ConversationsService {
       ssh: buildSshConfig(connection, (s) => this.encryption.decrypt(s)),
       connectionLimit: 2,
       connectTimeout: 8000,
-    });
+    };
+    return engine === 'postgres'
+      ? this.executePaginatedPostgres(poolCfg, sql, page, pageSize, offset)
+      : this.executePaginatedMysql(poolCfg, sql, page, pageSize, offset);
+  }
 
+  private async executePaginatedMysql(
+    poolCfg: Parameters<typeof createMysqlPool>[0],
+    sql: string,
+    page: number,
+    pageSize: number,
+    offset: number,
+  ) {
+    const { pool, cleanup } = await createMysqlPool(poolCfg);
     const start = Date.now();
 
     try {
@@ -908,6 +928,84 @@ export class ConversationsService {
         executionTimeMs: Date.now() - start,
       };
     } finally {
+      await cleanup();
+    }
+  }
+
+  private async executePaginatedPostgres(
+    poolCfg: Parameters<typeof createPostgresPool>[0],
+    sql: string,
+    page: number,
+    pageSize: number,
+    offset: number,
+  ) {
+    const { pool, cleanup } = await createPostgresPool(poolCfg);
+    const start = Date.now();
+    // Use one dedicated client so statement_timeout applies to every query.
+    const client = await pool.connect();
+
+    try {
+      await client.query("SET statement_timeout = '30s'");
+
+      // Guardrail — estimate scan size via EXPLAIN (JSON plan) before real rows.
+      try {
+        const plan = await client.query(`EXPLAIN (FORMAT JSON) ${sql}`);
+        const root = (plan.rows[0]?.['QUERY PLAN'] as
+          | Array<{ Plan?: { ['Plan Rows']?: number } }>
+          | undefined)?.[0];
+        const estRows = Number(root?.Plan?.['Plan Rows'] ?? 0);
+        const verdict = this.guard.evaluateExplain([{ rows: estRows }]);
+        if (!verdict.allowed) {
+          throw new GuardrailBlockedError(
+            verdict.reason ?? 'Query blocked by guardrail',
+          );
+        }
+      } catch (e) {
+        if (e instanceof GuardrailBlockedError) throw e;
+        // EXPLAIN itself failed — let normal execution surface the real error.
+      }
+
+      const countSql = `SELECT COUNT(*) AS total FROM (${sql}) AS _count_query`;
+      let totalCount = 0;
+
+      try {
+        const countRes = await client.query(countSql);
+        totalCount = Number(countRes.rows[0]?.['total'] ?? 0);
+      } catch {
+        const res = await client.query(sql);
+        return {
+          rows: res.rows as Record<string, unknown>[],
+          fields: (res.fields ?? []).map((f) => ({
+            name: f.name,
+            type: f.dataTypeID ?? 0,
+          })),
+          rowCount: res.rows.length,
+          totalCount: res.rows.length,
+          page: 1,
+          pageSize: res.rows.length,
+          totalPages: 1,
+          executionTimeMs: Date.now() - start,
+        };
+      }
+
+      const paginatedSql = `${sql} LIMIT ${pageSize} OFFSET ${offset}`;
+      const res = await client.query(paginatedSql);
+
+      return {
+        rows: res.rows as Record<string, unknown>[],
+        fields: (res.fields ?? []).map((f) => ({
+          name: f.name,
+          type: f.dataTypeID ?? 0,
+        })),
+        rowCount: res.rows.length,
+        totalCount,
+        page,
+        pageSize,
+        totalPages: Math.ceil(totalCount / pageSize),
+        executionTimeMs: Date.now() - start,
+      };
+    } finally {
+      client.release();
       await cleanup();
     }
   }

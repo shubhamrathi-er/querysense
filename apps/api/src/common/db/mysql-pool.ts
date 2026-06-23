@@ -1,6 +1,8 @@
 import * as mysql from 'mysql2/promise';
+import { Pool as PgPool } from 'pg';
 import * as net from 'net';
 import { Client } from 'ssh2';
+import { DbEngine } from './engine';
 
 export interface SshConfig {
   host: string;
@@ -159,4 +161,214 @@ export async function createMysqlPool(cfg: PoolConfig): Promise<TunneledPool> {
   };
 
   return { pool, cleanup };
+}
+
+export interface TunneledPgPool {
+  pool: PgPool;
+  cleanup: () => Promise<void>;
+}
+
+/**
+ * Create a node-postgres pool, transparently tunnelling through SSH when
+ * configured. Mirrors createMysqlPool(); always pair with cleanup().
+ */
+export async function createPostgresPool(
+  cfg: PoolConfig,
+): Promise<TunneledPgPool> {
+  let tunnel: { host: string; port: number; close: () => Promise<void> } | null =
+    null;
+  let host = cfg.host;
+  let port = cfg.port;
+
+  if (cfg.ssh) {
+    tunnel = await openSshTunnel(cfg.ssh, cfg.host, cfg.port);
+    host = tunnel.host;
+    port = tunnel.port;
+  }
+
+  const pool = new PgPool({
+    host,
+    port,
+    database: cfg.database,
+    user: cfg.user,
+    password: cfg.password,
+    ssl: cfg.ssl ? { rejectUnauthorized: false } : undefined,
+    max: cfg.connectionLimit ?? 3,
+    connectionTimeoutMillis: cfg.connectTimeout ?? 10000,
+  });
+  // A pool-level error handler is mandatory for pg; without it an idle-client
+  // error (e.g. server restart) crashes the process.
+  pool.on('error', () => {
+    /* swallow; the failing client is removed from the pool automatically */
+  });
+
+  const cleanup = async () => {
+    try {
+      await pool.end();
+    } catch {
+      /* ignore */
+    }
+    if (tunnel) await tunnel.close();
+  };
+
+  return { pool, cleanup };
+}
+
+/**
+ * Engine-agnostic SQL client. `query()` returns rows directly (normalising the
+ * mysql2 `[rows, fields]` tuple vs pg `{ rows }` shape) so call sites that share
+ * otherwise-identical SQL don't have to branch on the driver. Identifier quoting
+ * and dialect-specific SQL still differ — see quoteIdent() and the per-feature
+ * introspectors/adapters.
+ */
+/** Query + bulk-insert surface available both on a pool and inside a transaction. */
+export interface SqlExecutor {
+  readonly engine: DbEngine;
+  query<T = Record<string, unknown>>(
+    sql: string,
+    params?: unknown[],
+  ): Promise<T[]>;
+  /**
+   * Insert many rows in one statement. `table` and `columns` must be
+   * already-quoted SQL identifier fragments (see quoteIdent). Returns the row
+   * count. Abstracts mysql2's `VALUES ?` vs pg's `($1,$2),...` placeholder forms.
+   */
+  bulkInsert(
+    table: string,
+    columns: string[],
+    rows: unknown[][],
+  ): Promise<number>;
+}
+
+export interface SqlClient extends SqlExecutor {
+  ping(): Promise<void>;
+  cleanup(): Promise<void>;
+  /** Run `fn` inside a transaction on a single dedicated connection. */
+  transaction<T>(fn: (tx: SqlExecutor) => Promise<T>): Promise<T>;
+}
+
+function mysqlBulkInsert(
+  q: (sql: string, params?: unknown[]) => Promise<unknown>,
+) {
+  return async (table: string, columns: string[], rows: unknown[][]) => {
+    if (rows.length === 0) return 0;
+    await q(`INSERT INTO ${table} (${columns.join(', ')}) VALUES ?`, [rows]);
+    return rows.length;
+  };
+}
+
+function pgBulkInsert(
+  q: (sql: string, params?: unknown[]) => Promise<unknown>,
+) {
+  return async (table: string, columns: string[], rows: unknown[][]) => {
+    if (rows.length === 0) return 0;
+    const width = columns.length;
+    const tuples = rows
+      .map(
+        (_, ri) =>
+          `(${columns.map((__, ci) => `$${ri * width + ci + 1}`).join(', ')})`,
+      )
+      .join(', ');
+    await q(
+      `INSERT INTO ${table} (${columns.join(', ')}) VALUES ${tuples}`,
+      rows.flat(),
+    );
+    return rows.length;
+  };
+}
+
+/**
+ * Create a normalised SqlClient for the given engine. Note: parameter
+ * placeholders are NOT translated — MySQL uses `?`, Postgres uses `$1`. Callers
+ * that parameterise must use the right placeholder for the engine (most
+ * introspection SQL inlines validated identifiers and takes no params).
+ */
+export async function createPool(
+  engine: DbEngine,
+  cfg: PoolConfig,
+): Promise<SqlClient> {
+  if (engine === 'postgres') {
+    const { pool, cleanup } = await createPostgresPool(cfg);
+    const query = async <T>(sql: string, params?: unknown[]) =>
+      (await pool.query(sql, params)).rows as T[];
+    return {
+      engine,
+      query,
+      bulkInsert: pgBulkInsert((s, p) => pool.query(s, p)),
+      ping: async () => {
+        await pool.query('SELECT 1');
+      },
+      cleanup,
+      transaction: async <T>(fn: (tx: SqlExecutor) => Promise<T>) => {
+        const client = await pool.connect();
+        const txQuery = async <U>(sql: string, params?: unknown[]) =>
+          (await client.query(sql, params)).rows as U[];
+        try {
+          await client.query('BEGIN');
+          const result = await fn({
+            engine,
+            query: txQuery,
+            bulkInsert: pgBulkInsert((s, p) => client.query(s, p)),
+          });
+          await client.query('COMMIT');
+          return result;
+        } catch (err) {
+          try {
+            await client.query('ROLLBACK');
+          } catch {
+            /* connection may be unusable */
+          }
+          throw err;
+        } finally {
+          client.release();
+        }
+      },
+    };
+  }
+
+  const { pool, cleanup } = await createMysqlPool(cfg);
+  const query = async <T>(sql: string, params?: unknown[]) => {
+    const [rows] = await pool.query(sql, params);
+    return rows as T[];
+  };
+  return {
+    engine,
+    query,
+    bulkInsert: mysqlBulkInsert((s, p) => pool.query(s, p)),
+    ping: async () => {
+      const conn = await pool.getConnection();
+      try {
+        await conn.ping();
+      } finally {
+        conn.release();
+      }
+    },
+    cleanup,
+    transaction: async <T>(fn: (tx: SqlExecutor) => Promise<T>) => {
+      const conn = await pool.getConnection();
+      const txQuery = async <U>(sql: string, params?: unknown[]) => {
+        const [rows] = await conn.query(sql, params);
+        return rows as U[];
+      };
+      try {
+        await conn.beginTransaction();
+        const result = await fn({
+          engine,
+          query: txQuery,
+          bulkInsert: mysqlBulkInsert((s, p) => conn.query(s, p)),
+        });
+        await conn.commit();
+        return result;
+      } catch (err) {
+        try {
+          await conn.rollback();
+        } catch {
+          /* connection may be unusable */
+        }
+        throw err;
+      } finally {
+        conn.release();
+      }
+    },
+  };
 }

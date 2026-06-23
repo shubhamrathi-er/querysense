@@ -1,21 +1,54 @@
 import type { ChatMessage } from '../interfaces/ai-provider.interface';
+import type { DbEngine } from '../../common/db/engine';
 
 export interface SQLPromptParams {
   userQuestion: string;
   schemaContext: string;
   conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }>;
   databaseName: string;
+  engine: DbEngine;
   /** Past question→SQL pairs that ran successfully on this database. */
   fewShotExamples?: Array<{ question: string; sql: string }>;
+}
+
+interface DialectGuidance {
+  name: string;
+  lastMonth: string;
+  thisYear: string;
+  extraRules: string[];
+}
+
+function dialectGuidance(engine: DbEngine): DialectGuidance {
+  if (engine === 'postgres') {
+    return {
+      name: 'PostgreSQL',
+      lastMonth: `WHERE date_col >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') AND date_col < DATE_TRUNC('month', CURRENT_DATE)`,
+      thisYear: `WHERE EXTRACT(YEAR FROM date_col) = EXTRACT(YEAR FROM CURRENT_DATE)`,
+      extraRules: [
+        `PostgreSQL folds unquoted identifiers to lowercase — double-quote any table/column whose name isn't all-lowercase (e.g. "OrderItems").`,
+        `Use ILIKE for case-insensitive text matching.`,
+      ],
+    };
+  }
+  return {
+    name: 'MySQL',
+    lastMonth: `WHERE date_col >= DATE_FORMAT(DATE_SUB(NOW(), INTERVAL 1 MONTH), '%Y-%m-01') AND date_col < DATE_FORMAT(NOW(), '%Y-%m-01')`,
+    thisYear: `WHERE YEAR(date_col) = YEAR(NOW())`,
+    extraRules: [],
+  };
 }
 
 export function buildSQLGenerationPrompt(
   params: SQLPromptParams,
 ): ChatMessage[] {
-  const systemPrompt = `You are an expert MySQL query generator for the database "${params.databaseName}".
+  const d = dialectGuidance(params.engine);
+  const extraRules = d.extraRules
+    .map((r, i) => `${10 + i}. ${r}`)
+    .join('\n');
+  const systemPrompt = `You are an expert ${d.name} query generator for the database "${params.databaseName}".
 
 ## YOUR ROLE
-Convert natural language questions into precise, optimized MySQL queries.
+Convert natural language questions into precise, optimized ${d.name} queries.
 
 ## DATABASE SCHEMA
 ${params.schemaContext}
@@ -25,11 +58,11 @@ ${params.schemaContext}
 2. ALWAYS use table aliases for clarity (e.g. SELECT u.name FROM users u)
 3. ALWAYS add LIMIT 500 unless user specifies a limit or asks for aggregations
 4. NEVER use DROP, DELETE, UPDATE, INSERT, TRUNCATE, ALTER, CREATE, or any DDL/DML
-5. For "last month": WHERE date_col >= DATE_FORMAT(DATE_SUB(NOW(), INTERVAL 1 MONTH), '%Y-%m-01') AND date_col < DATE_FORMAT(NOW(), '%Y-%m-01')
-6. For "this year": WHERE YEAR(date_col) = YEAR(NOW())
+5. For "last month": ${d.lastMonth}
+6. For "this year": ${d.thisYear}
 7. Always wrap your SQL in a \`\`\`sql code block
 8. Use COUNT(*) for counting, SUM() for totals, AVG() for averages
-9. Column comments marked "e.g. 'x', 'y'" list ACTUAL stored values — match their exact casing/spelling in WHERE filters
+9. Column comments marked "e.g. 'x', 'y'" list ACTUAL stored values — match their exact casing/spelling in WHERE filters${extraRules ? '\n' + extraRules : ''}
 
 ## OUTPUT FORMAT
 Respond with the SQL query inside a \`\`\`sql code block, then these two lines immediately after the block:
@@ -82,6 +115,8 @@ const CATEGORICAL_TYPES = new Set([
   'enum',
   'set',
   'tinyint',
+  'boolean',
+  'character varying',
 ]);
 
 /** Render up to 3 example values for a categorical column, or null. */
@@ -168,6 +203,7 @@ ${cols}
 
 export interface RepairPromptParams {
   databaseName: string;
+  engine: DbEngine;
   schemaContext: string;
   question?: string;
   brokenSql: string;
@@ -179,7 +215,8 @@ export interface RepairPromptParams {
  * against the live database (e.g. unknown column, bad join, type mismatch).
  */
 export function buildRepairPrompt(params: RepairPromptParams): ChatMessage[] {
-  const systemPrompt = `You are an expert MySQL engineer FIXING a query that failed to execute against the database "${params.databaseName}".
+  const d = dialectGuidance(params.engine);
+  const systemPrompt = `You are an expert ${d.name} engineer FIXING a query that failed to execute against the database "${params.databaseName}".
 
 ## DATABASE SCHEMA
 ${params.schemaContext}

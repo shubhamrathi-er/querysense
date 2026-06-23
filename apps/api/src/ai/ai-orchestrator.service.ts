@@ -102,7 +102,10 @@ export class AiOrchestratorService {
         const result = await provider.complete(messages);
 
         // Check for a structured clarification (ambiguous question).
-        const clarification = this.validator.parseClarification(result.content);
+        const clarification = this.validator.parseClarification(
+          result.content,
+          params.engine,
+        );
         if (clarification.is) {
           return {
             type: 'clarification',
@@ -139,14 +142,14 @@ export class AiOrchestratorService {
         }
 
         // Validate the SQL
-        const validation = this.validator.validate(sql);
+        const validation = this.validator.validate(sql, params.engine);
         if (!validation.valid) {
           this.logger.warn(`SQL validation failed: ${validation.error}`);
           continue;
         }
 
         const meta = this.validator.extractMeta(result.content);
-        const accessed = this.validator.extractAccessed(sql);
+        const accessed = this.validator.extractAccessed(sql, params.engine);
         return {
           type: 'sql',
           sql,
@@ -193,7 +196,7 @@ export class AiOrchestratorService {
         if (this.validator.isCannotAnswer(result.content).is) return null;
 
         const sql = this.validator.extractSQL(result.content);
-        if (!sql || !this.validator.validate(sql).valid) continue;
+        if (!sql || !this.validator.validate(sql, params.engine).valid) continue;
 
         return {
           sql,

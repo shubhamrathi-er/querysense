@@ -108,6 +108,7 @@ model DatabaseConnection {
   id                String           @id @default(cuid())
   workspaceId       String
   name              String
+  engine            String           @default("mysql")
   host              String
   port              Int              @default(3306)
   databaseName      String

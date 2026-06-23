@@ -5,8 +5,14 @@ import {
   BadRequestException,
   ConflictException,
 } from '@nestjs/common';
-import * as mysql from 'mysql2/promise';
-import { createMysqlPool, buildSshConfig } from '../common/db/mysql-pool';
+import {
+  createPool,
+  type SqlClient,
+  type SqlExecutor,
+  buildSshConfig,
+} from '../common/db/mysql-pool';
+import { DbEngine, normalizeEngine } from '../common/db/engine';
+import { CsvDialect, csvDialect } from './csv-import-dialect';
 import { PrismaService } from '../../prisma/prisma.service';
 import { EncryptionService } from '../common/encryption/encryption.service';
 import { ConnectionsService } from './connections.service';
@@ -40,20 +46,14 @@ export interface CsvImportResult {
   errors: string[];
 }
 
-/** MySQL types we permit when creating a brand-new table from a CSV. */
-const ALLOWED_NEW_TYPES = new Set<string>([
-  'INT',
-  'BIGINT',
-  'DOUBLE',
-  'DECIMAL(18,4)',
-  'VARCHAR(255)',
-  'TEXT',
-  'DATE',
-  'DATETIME',
-  'BOOLEAN',
-]);
+/** Per-request context: the live client and the engine's DDL dialect. */
+interface ImportCtx {
+  client: SqlClient;
+  d: CsvDialect;
+  engine: DbEngine;
+  databaseName: string;
+}
 
-const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const INSERT_CHUNK_SIZE = 500;
 
 @Injectable()
@@ -66,23 +66,17 @@ export class CsvImportService {
     private connectionsService: ConnectionsService,
   ) {}
 
-  /** Escape and validate a SQL identifier (table or column name). */
-  private ident(name: string): string {
-    if (!IDENTIFIER.test(name)) {
-      throw new BadRequestException(
-        `Invalid identifier "${name}". Use letters, numbers and underscores only.`,
-      );
-    }
-    return `\`${name}\``;
-  }
-
-  private async createPool(connectionId: string, workspaceId: string) {
+  private async openCtx(
+    connectionId: string,
+    workspaceId: string,
+  ): Promise<ImportCtx> {
     const connection = await this.prisma.databaseConnection.findFirst({
       where: { id: connectionId, workspaceId },
     });
     if (!connection) throw new NotFoundException('Connection not found');
 
-    const { pool, cleanup } = await createMysqlPool({
+    const engine = normalizeEngine(connection.engine);
+    const client = await createPool(engine, {
       host: connection.host,
       port: connection.port,
       database: connection.databaseName,
@@ -94,7 +88,12 @@ export class CsvImportService {
       connectTimeout: 10000,
     });
 
-    return { pool, cleanup, databaseName: connection.databaseName };
+    return {
+      client,
+      engine,
+      d: csvDialect(engine),
+      databaseName: connection.databaseName,
+    };
   }
 
   /**
@@ -105,54 +104,19 @@ export class CsvImportService {
     connectionId: string,
     workspaceId: string,
   ): Promise<ImportTargetTable[]> {
-    const { pool, cleanup, databaseName } = await this.createPool(
-      connectionId,
-      workspaceId,
-    );
+    const ctx = await this.openCtx(connectionId, workspaceId);
 
     try {
-      const [rows] = await pool.query<mysql.RowDataPacket[]>(
-        `
-        SELECT
-          c.TABLE_NAME      AS tableName,
-          c.COLUMN_NAME     AS columnName,
-          c.COLUMN_TYPE     AS columnType,
-          c.IS_NULLABLE     AS isNullable,
-          c.COLUMN_DEFAULT  AS columnDefault,
-          c.EXTRA           AS extra
-        FROM information_schema.COLUMNS c
-        JOIN information_schema.TABLES t
-          ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
-         AND t.TABLE_NAME = c.TABLE_NAME
-        WHERE c.TABLE_SCHEMA = ?
-          AND t.TABLE_TYPE = 'BASE TABLE'
-        ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION
-        `,
-        [databaseName],
-      );
+      const rows =
+        ctx.engine === 'postgres'
+          ? await this.pgImportTargets(ctx)
+          : await this.mysqlImportTargets(ctx);
 
       const byTable = new Map<string, ImportTargetColumn[]>();
-      for (const row of rows) {
-        const r = row as Record<string, unknown>;
-        const tableName = String(r['tableName']);
-        const isNullable = String(r['isNullable']).toUpperCase() === 'YES';
-        const extra = String(r['extra'] ?? '').toLowerCase();
-        const isAutoIncrement = extra.includes('auto_increment');
-        const hasDefault =
-          r['columnDefault'] !== null || extra.includes('default_generated');
-
-        const col: ImportTargetColumn = {
-          columnName: String(r['columnName']),
-          dataType: String(r['columnType']),
-          isNullable,
-          isAutoIncrement,
-          hasDefault,
-          isRequired: !isNullable && !hasDefault && !isAutoIncrement,
-        };
-
-        const list = byTable.get(tableName) ?? [];
-        list.push(col);
-        byTable.set(tableName, list);
+      for (const col of rows) {
+        const list = byTable.get(col.tableName) ?? [];
+        list.push(col.column);
+        byTable.set(col.tableName, list);
       }
 
       return [...byTable.entries()].map(([tableName, columns]) => ({
@@ -160,8 +124,93 @@ export class CsvImportService {
         columns,
       }));
     } finally {
-      await cleanup();
+      await ctx.client.cleanup();
     }
+  }
+
+  private async mysqlImportTargets(ctx: ImportCtx) {
+    const rows = await ctx.client.query<Record<string, unknown>>(
+      `
+      SELECT
+        c.TABLE_NAME      AS tableName,
+        c.COLUMN_NAME     AS columnName,
+        c.COLUMN_TYPE     AS columnType,
+        c.IS_NULLABLE     AS isNullable,
+        c.COLUMN_DEFAULT  AS columnDefault,
+        c.EXTRA           AS extra
+      FROM information_schema.COLUMNS c
+      JOIN information_schema.TABLES t
+        ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
+       AND t.TABLE_NAME = c.TABLE_NAME
+      WHERE c.TABLE_SCHEMA = ?
+        AND t.TABLE_TYPE = 'BASE TABLE'
+      ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION
+      `,
+      [ctx.databaseName],
+    );
+    return rows.map((r) => {
+      const isNullable = String(r['isNullable']).toUpperCase() === 'YES';
+      const extra = String(r['extra'] ?? '').toLowerCase();
+      const isAutoIncrement = extra.includes('auto_increment');
+      const hasDefault =
+        r['columnDefault'] !== null || extra.includes('default_generated');
+      return {
+        tableName: String(r['tableName']),
+        column: {
+          columnName: String(r['columnName']),
+          dataType: String(r['columnType']),
+          isNullable,
+          isAutoIncrement,
+          hasDefault,
+          isRequired: !isNullable && !hasDefault && !isAutoIncrement,
+        } satisfies ImportTargetColumn,
+      };
+    });
+  }
+
+  private async pgImportTargets(ctx: ImportCtx) {
+    const rows = await ctx.client.query<Record<string, unknown>>(
+      `
+      SELECT
+        c.table_name AS "tableName",
+        c.column_name AS "columnName",
+        c.data_type AS "dataType",
+        c.character_maximum_length AS "charLen",
+        c.is_nullable AS "isNullable",
+        c.column_default AS "columnDefault",
+        c.is_identity AS "isIdentity"
+      FROM information_schema.columns c
+      JOIN information_schema.tables t
+        ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+      WHERE c.table_schema = current_schema()
+        AND t.table_type = 'BASE TABLE'
+      ORDER BY c.table_name, c.ordinal_position
+      `,
+    );
+    return rows.map((r) => {
+      const isNullable = String(r['isNullable']).toUpperCase() === 'YES';
+      const def = r['columnDefault'];
+      const isAutoIncrement =
+        String(r['isIdentity'] ?? '').toUpperCase() === 'YES' ||
+        /nextval\(/i.test(String(def ?? ''));
+      const hasDefault = def !== null || isAutoIncrement;
+      const charLen = r['charLen'];
+      const dataType =
+        charLen !== null && charLen !== undefined
+          ? `${String(r['dataType'])}(${Number(charLen)})`
+          : String(r['dataType']);
+      return {
+        tableName: String(r['tableName']),
+        column: {
+          columnName: String(r['columnName']),
+          dataType,
+          isNullable,
+          isAutoIncrement,
+          hasDefault,
+          isRequired: !isNullable && !hasDefault && !isAutoIncrement,
+        } satisfies ImportTargetColumn,
+      };
+    });
   }
 
   async importCsv(
@@ -173,10 +222,12 @@ export class CsvImportService {
       throw new BadRequestException('At least one column mapping is required.');
     }
 
+    const ctx = await this.openCtx(connectionId, workspaceId);
+
     // Validate identifiers up-front so we fail before touching the DB.
-    const escTable = this.ident(dto.tableName);
+    const escTable = ctx.d.ident(dto.tableName);
     for (const m of dto.columns) {
-      this.ident(m.dbColumn);
+      ctx.d.ident(m.dbColumn);
     }
 
     // Guard against duplicate target columns.
@@ -187,16 +238,15 @@ export class CsvImportService {
       );
     }
 
-    const { pool, cleanup } = await this.createPool(connectionId, workspaceId);
     let tableCreated = false;
     let columnsAdded: string[] = [];
 
     try {
       if (dto.mode === 'new') {
-        await this.createTable(pool, escTable, dto);
+        await this.createTable(ctx, escTable, dto);
         tableCreated = true;
       } else {
-        columnsAdded = await this.prepareExistingTable(pool, escTable, dto);
+        columnsAdded = await this.prepareExistingTable(ctx, escTable, dto);
       }
 
       // Skip rows that already exist (by the chosen unique keys) before inserting.
@@ -204,7 +254,7 @@ export class CsvImportService {
       let rowsSkipped = 0;
       if (dto.mode === 'existing' && dto.uniqueKeys && dto.uniqueKeys.length) {
         const filtered = await this.filterDuplicates(
-          pool,
+          ctx,
           escTable,
           dto,
           dto.uniqueKeys,
@@ -216,7 +266,7 @@ export class CsvImportService {
       // All-or-nothing: every batch inserts inside one transaction. If any batch
       // fails the whole transaction is rolled back — no partial data lands.
       const rowsInserted = await this.insertRowsAtomic(
-        pool,
+        ctx,
         escTable,
         dto,
         rowsToInsert,
@@ -240,13 +290,13 @@ export class CsvImportService {
         errors: [],
       };
     } catch (err) {
-      // The data transaction already rolled back. DDL (CREATE/ALTER) auto-commits
-      // in MySQL and can't be rolled back, so undo it explicitly to leave the
-      // database exactly as it was before the import.
-      await this.revertSchemaChanges(pool, escTable, tableCreated, columnsAdded);
+      // The data transaction already rolled back. DDL (CREATE/ALTER) ran outside
+      // a transaction, so undo it explicitly to leave the database exactly as it
+      // was before the import.
+      await this.revertSchemaChanges(ctx, escTable, tableCreated, columnsAdded);
       throw err;
     } finally {
-      await cleanup();
+      await ctx.client.cleanup();
       // Refresh stored schema metadata so the new/updated table is queryable
       // in chat right away. Best-effort — never fail the import on a sync error.
       try {
@@ -263,18 +313,18 @@ export class CsvImportService {
 
   /** Undo CREATE TABLE / ADD COLUMN done earlier in a now-failed import. */
   private async revertSchemaChanges(
-    pool: mysql.Pool,
+    ctx: ImportCtx,
     escTable: string,
     tableCreated: boolean,
     columnsAdded: string[],
   ): Promise<void> {
     try {
       if (tableCreated) {
-        await pool.query(`DROP TABLE IF EXISTS ${escTable}`);
+        await ctx.client.query(`DROP TABLE IF EXISTS ${escTable}`);
       } else if (columnsAdded.length) {
         for (const col of columnsAdded) {
-          await pool.query(
-            `ALTER TABLE ${escTable} DROP COLUMN ${this.ident(col)}`,
+          await ctx.client.query(
+            `ALTER TABLE ${escTable} DROP COLUMN ${ctx.d.ident(col)}`,
           );
         }
       }
@@ -288,16 +338,16 @@ export class CsvImportService {
   }
 
   private async createTable(
-    pool: mysql.Pool,
+    ctx: ImportCtx,
     escTable: string,
     dto: CsvImportDto,
   ): Promise<void> {
-    const [existing] = await pool.query<mysql.RowDataPacket[]>(
-      `SELECT 1 FROM information_schema.TABLES
-       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? LIMIT 1`,
+    const exists = await ctx.client.query(
+      `SELECT 1 FROM information_schema.tables
+       WHERE table_schema = ${ctx.d.currentSchemaExpr()} AND table_name = ${this.ph(ctx, 1)} LIMIT 1`,
       [dto.tableName],
     );
-    if (existing.length > 0) {
+    if (exists.length > 0) {
       throw new ConflictException(
         `Table "${dto.tableName}" already exists. Choose a different name or insert into the existing table.`,
       );
@@ -306,39 +356,38 @@ export class CsvImportService {
     // If the data already carries its own `id` column, don't inject a synthetic
     // one (that would be a duplicate column name). Promote an integer `id` to the
     // primary key; otherwise leave it as a regular column.
-    const idColumn = dto.columns.find(
-      (m) => m.dbColumn.toLowerCase() === 'id',
-    );
+    const idColumn = dto.columns.find((m) => m.dbColumn.toLowerCase() === 'id');
     const idIsInteger =
       !!idColumn &&
       ['INT', 'BIGINT'].includes((idColumn.dbType ?? '').toUpperCase());
 
     const colDefs = dto.columns.map((m) => {
-      const type = (m.dbType ?? 'TEXT').toUpperCase();
-      if (!ALLOWED_NEW_TYPES.has(type)) {
+      const canonical = (m.dbType ?? 'TEXT').toUpperCase();
+      if (!ctx.d.isAllowedType(canonical)) {
         throw new BadRequestException(
           `Unsupported column type "${m.dbType}" for column "${m.dbColumn}".`,
         );
       }
+      const type = ctx.d.sqlType(canonical);
       if (m.dbColumn.toLowerCase() === 'id' && idIsInteger) {
-        return `${this.ident(m.dbColumn)} ${type} NOT NULL PRIMARY KEY`;
+        return `${ctx.d.ident(m.dbColumn)} ${type} NOT NULL PRIMARY KEY`;
       }
-      return `${this.ident(m.dbColumn)} ${type} NULL`;
+      return `${ctx.d.ident(m.dbColumn)} ${type} NULL`;
     });
 
     const lines: string[] = [];
     if (!idColumn) {
       // No id in the data — add an auto-increment surrogate key.
-      lines.push('  `id` BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY');
+      lines.push(`  ${ctx.d.surrogateKeyDef()}`);
     }
     lines.push(...colDefs.map((d) => `  ${d}`));
 
     const createSql =
       `CREATE TABLE ${escTable} (\n` +
       lines.join(',\n') +
-      `\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`;
+      `\n)${ctx.d.createTableTail()}`;
 
-    await pool.query(createSql);
+    await ctx.client.query(createSql);
   }
 
   /**
@@ -348,15 +397,15 @@ export class CsvImportService {
    * UI's signal that the user opted to add it). Returns the columns added.
    */
   private async prepareExistingTable(
-    pool: mysql.Pool,
+    ctx: ImportCtx,
     escTable: string,
     dto: CsvImportDto,
   ): Promise<string[]> {
-    const [cols] = await pool.query<mysql.RowDataPacket[]>(
-      `SELECT COLUMN_NAME AS columnName, IS_NULLABLE AS isNullable,
-              COLUMN_DEFAULT AS columnDefault, EXTRA AS extra
-       FROM information_schema.COLUMNS
-       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
+    const cols = await ctx.client.query<Record<string, unknown>>(
+      `SELECT column_name AS "columnName", is_nullable AS "isNullable",
+              column_default AS "columnDefault", ${this.identityExpr(ctx)} AS "isAuto"
+       FROM information_schema.columns
+       WHERE table_schema = ${ctx.d.currentSchemaExpr()} AND table_name = ${this.ph(ctx, 1)}`,
       [dto.tableName],
     );
 
@@ -366,17 +415,15 @@ export class CsvImportService {
       );
     }
 
-    const existingNames = new Set(
-      cols.map((c) => String((c as Record<string, unknown>)['columnName'])),
-    );
+    const existingNames = new Set(cols.map((c) => String(c['columnName'])));
 
     // Add any mapped columns that don't exist yet (new columns from the CSV).
     const columnsAdded: string[] = [];
     for (const m of dto.columns) {
       if (existingNames.has(m.dbColumn)) continue;
 
-      const type = (m.dbType ?? '').toUpperCase();
-      if (!ALLOWED_NEW_TYPES.has(type)) {
+      const canonical = (m.dbType ?? '').toUpperCase();
+      if (!ctx.d.isAllowedType(canonical)) {
         throw new BadRequestException(
           `Column "${m.dbColumn}" does not exist in table "${dto.tableName}". ` +
             `Provide a valid type to add it, or remove it from the mapping.`,
@@ -384,8 +431,8 @@ export class CsvImportService {
       }
 
       // New columns are nullable so existing rows remain valid.
-      await pool.query(
-        `ALTER TABLE ${escTable} ADD COLUMN ${this.ident(m.dbColumn)} ${type} NULL`,
+      await ctx.client.query(
+        `ALTER TABLE ${escTable} ADD COLUMN ${ctx.d.ident(m.dbColumn)} ${ctx.d.sqlType(canonical)} NULL`,
       );
       existingNames.add(m.dbColumn);
       columnsAdded.push(m.dbColumn);
@@ -395,13 +442,10 @@ export class CsvImportService {
     // must be mapped. Newly-added columns are nullable, so never required.
     const mapped = new Set(dto.columns.map((c) => c.dbColumn));
     for (const c of cols) {
-      const r = c as Record<string, unknown>;
-      const name = String(r['columnName']);
-      const isNullable = String(r['isNullable']).toUpperCase() === 'YES';
-      const extra = String(r['extra'] ?? '').toLowerCase();
-      const hasDefault =
-        r['columnDefault'] !== null || extra.includes('default_generated');
-      const isAutoIncrement = extra.includes('auto_increment');
+      const name = String(c['columnName']);
+      const isNullable = String(c['isNullable']).toUpperCase() === 'YES';
+      const hasDefault = c['columnDefault'] !== null;
+      const isAutoIncrement = this.isAutoFlag(ctx, c['isAuto']);
       const required = !isNullable && !hasDefault && !isAutoIncrement;
 
       if (required && !mapped.has(name)) {
@@ -420,7 +464,7 @@ export class CsvImportService {
    * mapped to the chosen DB key columns.
    */
   private async filterDuplicates(
-    pool: mysql.Pool,
+    ctx: ImportCtx,
     escTable: string,
     dto: CsvImportDto,
     uniqueKeys: string[],
@@ -453,7 +497,7 @@ export class CsvImportService {
 
     // Query which of those tuples already exist. NULLs never match in SQL, so
     // tuples containing a NULL key are not worth querying.
-    const escKeyCols = keyMap.map((k) => this.ident(k.dbColumn));
+    const escKeyCols = keyMap.map((k) => ctx.d.ident(k.dbColumn));
     const existing = new Set<string>();
     const queryable = [...csvTuples.values()].filter((t) =>
       t.every((v) => v !== null),
@@ -466,21 +510,15 @@ export class CsvImportService {
         .map((c, idx) => `${c} AS k${idx}`)
         .join(', ');
 
-      let sql: string;
-      let params: unknown[];
-      if (escKeyCols.length === 1) {
-        sql = `SELECT ${selectCols} FROM ${escTable} WHERE ${escKeyCols[0]} IN (?)`;
-        params = [chunk.map((t) => t[0])];
-      } else {
-        sql = `SELECT ${selectCols} FROM ${escTable} WHERE (${escKeyCols.join(
-          ', ',
-        )}) IN (?)`;
-        params = [chunk];
-      }
+      const { whereSql, params } = this.buildKeyExistence(
+        ctx,
+        escKeyCols,
+        chunk,
+      );
+      const sql = `SELECT ${selectCols} FROM ${escTable} WHERE ${whereSql}`;
 
-      const [found] = await pool.query<mysql.RowDataPacket[]>(sql, params);
-      for (const fr of found) {
-        const r = fr as Record<string, unknown>;
+      const found = await ctx.client.query<Record<string, unknown>>(sql, params);
+      for (const r of found) {
         const tuple = escKeyCols.map((_, idx) => {
           const v = r[`k${idx}`];
           return v === null || v === undefined ? null : String(v);
@@ -512,16 +550,14 @@ export class CsvImportService {
    * Returns the number of rows inserted (all of them, on success).
    */
   private async insertRowsAtomic(
-    pool: mysql.Pool,
+    ctx: ImportCtx,
     escTable: string,
     dto: CsvImportDto,
     rows: Record<string, string | null>[],
   ): Promise<number> {
     if (rows.length === 0) return 0;
 
-    const escCols = dto.columns.map((m) => this.ident(m.dbColumn));
-    const insertSql = `INSERT INTO ${escTable} (${escCols.join(', ')}) VALUES ?`;
-
+    const escCols = dto.columns.map((m) => ctx.d.ident(m.dbColumn));
     const toRowValues = (row: Record<string, string | null>): unknown[] =>
       dto.columns.map((m) => {
         const raw = row[m.csvColumn];
@@ -531,30 +567,29 @@ export class CsvImportService {
         return raw;
       });
 
-    // A transaction must run on a single dedicated connection, not the pool.
-    const conn = await pool.getConnection();
-    try {
-      await conn.beginTransaction();
-
+    return ctx.client.transaction(async (tx: SqlExecutor) => {
       let inserted = 0;
       for (let i = 0; i < rows.length; i += INSERT_CHUNK_SIZE) {
         const chunk = rows.slice(i, i + INSERT_CHUNK_SIZE);
         try {
-          await conn.query(insertSql, [chunk.map(toRowValues)]);
+          await tx.bulkInsert(escTable, escCols, chunk.map(toRowValues));
           inserted += chunk.length;
         } catch (chunkErr) {
-          // Pinpoint the offending row for a useful message. These probe
-          // inserts are discarded by the rollback below.
-          let detail =
+          const detail =
             chunkErr instanceof Error ? chunkErr.message : 'insert failed';
+          // MySQL lets us keep probing in the same transaction to pinpoint the
+          // bad row (the probe rows are discarded by the rollback). Postgres
+          // aborts the transaction on the first error, so we can only report the
+          // chunk range there.
           let rowNum = i + 1;
-          for (let j = 0; j < chunk.length; j++) {
-            try {
-              await conn.query(insertSql, [[toRowValues(chunk[j])]]);
-            } catch (rowErr) {
-              rowNum = i + j + 1;
-              detail = rowErr instanceof Error ? rowErr.message : detail;
-              break;
+          if (ctx.engine === 'mysql') {
+            for (let j = 0; j < chunk.length; j++) {
+              try {
+                await tx.bulkInsert(escTable, escCols, [toRowValues(chunk[j])]);
+              } catch {
+                rowNum = i + j + 1;
+                break;
+              }
             }
           }
           throw new BadRequestException(
@@ -562,18 +597,69 @@ export class CsvImportService {
           );
         }
       }
-
-      await conn.commit();
       return inserted;
-    } catch (err) {
-      try {
-        await conn.rollback();
-      } catch {
-        // Connection may already be unusable — nothing more we can do.
-      }
-      throw err;
-    } finally {
-      conn.release();
+    });
+  }
+
+  // ─── small dialect helpers ───────────────────────────────
+
+  /** Positional placeholder for the engine (`?` for MySQL, `$n` for Postgres). */
+  private ph(ctx: ImportCtx, n: number): string {
+    return ctx.engine === 'postgres' ? `$${n}` : '?';
+  }
+
+  /** information_schema expression that reveals an auto-increment/identity column. */
+  private identityExpr(ctx: ImportCtx): string {
+    return ctx.engine === 'postgres' ? 'is_identity' : 'extra';
+  }
+
+  private isAutoFlag(ctx: ImportCtx, value: unknown): boolean {
+    if (ctx.engine === 'postgres') {
+      return String(value ?? '').toUpperCase() === 'YES';
     }
+    return String(value ?? '')
+      .toLowerCase()
+      .includes('auto_increment');
+  }
+
+  /** Build the WHERE clause + params that test which key tuples already exist. */
+  private buildKeyExistence(
+    ctx: ImportCtx,
+    escKeyCols: string[],
+    chunk: (string | null)[][],
+  ): { whereSql: string; params: unknown[] } {
+    if (ctx.engine === 'mysql') {
+      // mysql2 expands a nested array for IN (?).
+      if (escKeyCols.length === 1) {
+        return {
+          whereSql: `${escKeyCols[0]} IN (?)`,
+          params: [chunk.map((t) => t[0])],
+        };
+      }
+      return {
+        whereSql: `(${escKeyCols.join(', ')}) IN (?)`,
+        params: [chunk],
+      };
+    }
+
+    // Postgres: explicit positional placeholders.
+    const width = escKeyCols.length;
+    if (width === 1) {
+      const placeholders = chunk.map((_, i) => `$${i + 1}`).join(', ');
+      return {
+        whereSql: `${escKeyCols[0]} IN (${placeholders})`,
+        params: chunk.map((t) => t[0]),
+      };
+    }
+    const tuples = chunk
+      .map(
+        (_, ri) =>
+          `(${escKeyCols.map((__, ci) => `$${ri * width + ci + 1}`).join(', ')})`,
+      )
+      .join(', ');
+    return {
+      whereSql: `(${escKeyCols.join(', ')}) IN (${tuples})`,
+      params: chunk.flat(),
+    };
   }
 }
