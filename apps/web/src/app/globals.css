@@ -1,0 +1,227 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Aurora Light — clean & airy, electric indigo accent */
+    --background: 210 40% 98%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 243 75% 59%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 9% 46%;
+    --accent: 226 100% 97%;
+    --accent-foreground: 243 60% 40%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 13% 91%;
+    --input: 220 16% 97%;
+    --ring: 243 75% 59%;
+    --radius: 0.625rem;
+  }
+
+  .dark {
+    /* Midnight Pro — Deep navy + Electric indigo */
+    --background: 222 47% 5%;
+    --foreground: 213 31% 91%;
+    --card: 222 47% 7%;
+    --card-foreground: 213 31% 91%;
+    --popover: 222 47% 8%;
+    --popover-foreground: 213 31% 91%;
+    --primary: 239 84% 67%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 222 47% 11%;
+    --secondary-foreground: 213 31% 91%;
+    --muted: 222 47% 11%;
+    --muted-foreground: 215 16% 47%;
+    --accent: 222 47% 13%;
+    --accent-foreground: 213 31% 91%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 222 47% 13%;
+    --input: 222 47% 9%;
+    --ring: 239 84% 67%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  /* Better heading hierarchy */
+  h1, h2, h3, h4, h5, h6 {
+    @apply tracking-tight;
+  }
+
+  /* Smooth focus rings — only on non-form controls, so inputs/textentries
+     don't get a second ring on top of their own focus styles. */
+  :focus-visible {
+    @apply outline-none;
+  }
+  a:focus-visible,
+  button:focus-visible,
+  [role="button"]:focus-visible,
+  [role="menuitem"]:focus-visible,
+  [role="tab"]:focus-visible,
+  [role="switch"]:focus-visible {
+    @apply ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+
+  /* Code blocks */
+  code, pre, .font-mono {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    font-feature-settings: "liga" 1, "calt" 1;
+  }
+}
+
+/* ─── Scrollbar ──────────────────────────────── */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-border rounded-full;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-muted-foreground/40;
+}
+
+/* ─── Selection ──────────────────────────────── */
+::selection {
+  @apply bg-primary/25 text-foreground;
+}
+
+/* ─── Animations ─────────────────────────────── */
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slide-in-left {
+  from { opacity: 0; transform: translateX(-8px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes shimmer {
+  0%   { background-position: 200% center; }
+  100% { background-position: -200% center; }
+}
+
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+.animate-marquee {
+  animation: marquee 28s linear infinite;
+}
+
+@keyframes pulse-ring {
+  0%   { box-shadow: 0 0 0 0 hsl(var(--primary) / 0.4); }
+  70%  { box-shadow: 0 0 0 6px hsl(var(--primary) / 0); }
+  100% { box-shadow: 0 0 0 0 hsl(var(--primary) / 0); }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.25s ease-out forwards;
+}
+
+.animate-slide-in-left {
+  animation: slide-in-left 0.3s ease-out forwards;
+}
+
+.animate-pulse-ring {
+  animation: pulse-ring 1.5s ease-out infinite;
+}
+
+/* ─── Glass morphism utility ─────────────────── */
+.glass {
+  background: hsl(var(--card) / 0.7);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid hsl(var(--border) / 0.5);
+}
+
+/* ─── Gradient utilities ─────────────────────── */
+.gradient-primary {
+  background: linear-gradient(
+    135deg,
+    hsl(var(--primary)) 0%,
+    hsl(239 84% 80%) 100%
+  );
+}
+
+.gradient-surface {
+  background: linear-gradient(
+    180deg,
+    hsl(var(--card)) 0%,
+    hsl(var(--background)) 100%
+  );
+}
+
+/* ─── Glow effects ───────────────────────────── */
+.glow-primary {
+  box-shadow: 0 0 20px hsl(var(--primary) / 0.3);
+}
+
+.glow-sm {
+  box-shadow: 0 0 10px hsl(var(--primary) / 0.2);
+}
+
+/* ─── Better table styling ───────────────────── */
+.data-table th {
+  @apply text-xs font-semibold text-muted-foreground uppercase tracking-wider;
+}
+
+.data-table td {
+  @apply text-sm font-mono;
+}
+
+.data-table tr:hover td {
+  @apply bg-accent/50;
+}
+
+/* ─── SQL syntax highlighting override ───────── */
+/* Code blocks stay dark in both themes (standard, and easier to read syntax). */
+.sql-block {
+  background: hsl(222 47% 4%) !important;
+  border: 1px solid hsl(222 47% 18%);
+  border-radius: var(--radius);
+}
+
+/* ─── Chat message animations ────────────────── */
+.message-enter {
+  animation: fade-in 0.3s ease-out forwards;
+}
+
+/* ─── Active nav indicator ───────────────────── */
+.nav-active {
+  position: relative;
+}
+
+.nav-active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 60%;
+  background: hsl(var(--primary));
+  border-radius: 0 2px 2px 0;
+}

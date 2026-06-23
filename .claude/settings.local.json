@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc *)",
+      "Bash(echo \"tsc exit: $?\")",
+      "Bash(npx eslint *)",
+      "Bash(echo \"eslint exit: $?\")",
+      "Bash(echo \"API tsc: $?\")",
+      "Bash(echo \"WEB tsc: $?\")",
+      "Bash(node *)",
+      "Bash(pnpm --version)",
+      "Bash(pnpm --filter web add xlsx)",
+      "Bash(npx prisma *)",
+      "Bash(echo \"API tsc exit: $?\")",
+      "Bash(pnpm --filter web add @xyflow/react dagre html-to-image)",
+      "Bash(pnpm --filter web add -D @types/dagre)",
+      "Bash(pnpm build *)",
+      "Bash(npx jest *)"
+    ]
+  }
+}

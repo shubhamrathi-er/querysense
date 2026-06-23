@@ -1,0 +1,409 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+// ============================================
+// AUTH
+// ============================================
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  avatarUrl     String?
+  passwordHash  String?
+  emailVerified DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts             Account[]
+  sessions             Session[]
+  workspaceMemberships WorkspaceMember[]
+  createdWorkspaces    Workspace[]       @relation("WorkspaceCreator")
+  auditLogs            AuditLog[]
+
+  @@map("users")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refreshToken      String? @db.Text
+  accessToken       String? @db.Text
+  expiresAt         Int?
+  tokenType         String?
+  scope             String?
+  idToken           String? @db.Text
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+// ============================================
+// WORKSPACES
+// ============================================
+
+model Workspace {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  description String?
+  logoUrl     String?
+  plan        Plan     @default(FREE)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  creatorId   String
+
+  creator       User                 @relation("WorkspaceCreator", fields: [creatorId], references: [id])
+  members       WorkspaceMember[]
+  connections   DatabaseConnection[]
+  conversations Conversation[]
+  savedQueries  SavedQuery[]
+  dashboards    Dashboard[]
+  auditLogs     AuditLog[]
+
+  @@map("workspaces")
+}
+
+model WorkspaceMember {
+  id          String    @id @default(cuid())
+  workspaceId String
+  userId      String
+  role        Role      @default(VIEWER)
+  invitedAt   DateTime  @default(now())
+  joinedAt    DateTime?
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@map("workspace_members")
+}
+
+// ============================================
+// DATABASE CONNECTIONS
+// ============================================
+
+model DatabaseConnection {
+  id                String           @id @default(cuid())
+  workspaceId       String
+  name              String
+  host              String
+  port              Int              @default(3306)
+  databaseName      String
+  username          String
+  encryptedPassword String
+  sslEnabled        Boolean          @default(false)
+  status            ConnectionStatus @default(PENDING)
+  lastTestedAt      DateTime?
+  lastSyncedAt      DateTime?
+
+  // SSH tunnel (for DBs reachable only via a bastion/VPN host). host/port are
+  // the DB as seen from the SSH server. Secrets are encrypted at rest.
+  sshEnabled        Boolean @default(false)
+  sshHost           String?
+  sshPort           Int?    @default(22)
+  sshUsername       String?
+  sshPassword       String? @db.Text
+  sshPrivateKey     String? @db.Text
+  sshPassphrase     String? @db.Text
+
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  workspace      Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  schemaMetadata SchemaMetadata[]
+  queryHistory   QueryHistory[]
+  modules        SchemaModule[]
+
+  @@map("database_connections")
+}
+
+// ============================================
+// SCHEMA METADATA
+// ============================================
+
+model SchemaMetadata {
+  id                  String   @id @default(cuid())
+  connectionId        String
+  tableName           String
+  tableComment        String?
+  aiDescription       String?  @db.Text
+  businessDescription String?  @db.Text
+  rowCount            BigInt?
+  isView              Boolean  @default(false)
+  moduleId            String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  connection DatabaseConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  columns    ColumnMetadata[]
+  embeddings SchemaEmbedding[]
+  module     SchemaModule?      @relation(fields: [moduleId], references: [id], onDelete: SetNull)
+
+  @@unique([connectionId, tableName])
+  @@map("schema_metadata")
+}
+
+// A logical grouping of tables (e.g. "Orders", "Catalog") within a connection.
+model SchemaModule {
+  id           String   @id @default(cuid())
+  connectionId String
+  name         String
+  description  String?  @db.Text
+  color        String?
+  ordinal      Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  connection DatabaseConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  tables     SchemaMetadata[]
+
+  @@unique([connectionId, name])
+  @@map("schema_modules")
+}
+
+model ColumnMetadata {
+  id               String   @id @default(cuid())
+  schemaMetadataId String
+  columnName       String
+  dataType         String
+  isNullable       Boolean
+  isPrimaryKey     Boolean  @default(false)
+  isForeignKey     Boolean  @default(false)
+  referencesTable  String?
+  referencesColumn String?
+  columnComment    String?
+  aiDescription    String?  @db.Text
+  sampleValues     Json?
+  ordinalPosition  Int      @default(0)
+  createdAt        DateTime @default(now())
+
+  schema SchemaMetadata @relation(fields: [schemaMetadataId], references: [id], onDelete: Cascade)
+
+  @@map("column_metadata")
+}
+
+// ============================================
+// CONVERSATIONS
+// ============================================
+
+model Conversation {
+  id          String   @id @default(cuid())
+  workspaceId String
+  title       String?
+  pinned      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  messages  Message[]
+
+  @@map("conversations")
+}
+
+model Message {
+  id             String      @id @default(cuid())
+  conversationId String
+  role           MessageRole
+  content        String      @db.Text
+  generatedSql   String?     @db.Text
+  sqlExplanation String?     @db.Text
+  chartConfig    Json?
+  clarification  Json?
+  queryMeta      Json?
+  insightText    String?     @db.Text
+  tokensUsed     Int?
+  modelUsed      String?
+  latencyMs      Int?
+  createdAt      DateTime    @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  queryHistory QueryHistory?
+
+  @@map("messages")
+}
+
+// ============================================
+// QUERY HISTORY
+// ============================================
+
+model QueryHistory {
+  id              String      @id @default(cuid())
+  connectionId    String
+  messageId       String?     @unique
+  sql             String      @db.Text
+  executedAt      DateTime    @default(now())
+  executionTimeMs Int
+  rowCount        Int
+  status          QueryStatus @default(SUCCESS)
+  errorMessage    String?     @db.Text
+  resultSnapshot  Json?
+
+  connection DatabaseConnection @relation(fields: [connectionId], references: [id])
+  message    Message?           @relation(fields: [messageId], references: [id])
+
+  @@map("query_history")
+}
+
+model SavedQuery {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  description String?
+  sql         String   @db.Text
+  tags        Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@map("saved_queries")
+}
+
+// ============================================
+// DASHBOARDS
+// ============================================
+
+model Dashboard {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  description String?
+  isPublic    Boolean  @default(false)
+  layout      Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  widgets   DashboardWidget[]
+
+  @@map("dashboards")
+}
+
+model DashboardWidget {
+  id                     String     @id @default(cuid())
+  dashboardId            String
+  title                  String
+  widgetType             WidgetType
+  sql                    String     @db.Text
+  chartConfig            Json?
+  position               Json
+  refreshIntervalSeconds Int?
+  createdAt              DateTime   @default(now())
+  updatedAt              DateTime   @updatedAt
+
+  dashboard Dashboard @relation(fields: [dashboardId], references: [id], onDelete: Cascade)
+
+  @@map("dashboard_widgets")
+}
+
+// ============================================
+// EMBEDDINGS (RAG - Phase 3)
+// ============================================
+
+model SchemaEmbedding {
+  id               String    @id @default(cuid())
+  schemaMetadataId String
+  chunkType        ChunkType
+  chunkText        String    @db.Text
+  embedding        Json
+  model            String
+  createdAt        DateTime  @default(now())
+
+  schema SchemaMetadata @relation(fields: [schemaMetadataId], references: [id], onDelete: Cascade)
+
+  @@map("schema_embeddings")
+}
+
+// ============================================
+// AUDIT LOGS
+// ============================================
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  workspaceId  String
+  userId       String
+  action       String
+  resourceType String
+  resourceId   String?
+  metadata     Json?
+  ipAddress    String?
+  userAgent    String?
+  createdAt    DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@map("audit_logs")
+}
+
+// ============================================
+// ENUMS
+// ============================================
+
+enum Plan {
+  FREE
+  PRO
+  TEAM
+  ENTERPRISE
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  EDITOR
+  VIEWER
+}
+
+enum ConnectionStatus {
+  PENDING
+  ACTIVE
+  ERROR
+  DISCONNECTED
+}
+
+enum QueryStatus {
+  SUCCESS
+  ERROR
+  TIMEOUT
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+}
+
+enum WidgetType {
+  CHART
+  TABLE
+  KPI
+  TEXT
+}
+
+enum ChunkType {
+  TABLE_SUMMARY
+  COLUMN_DETAILS
+  RELATIONSHIPS
+  GLOSSARY
+}
