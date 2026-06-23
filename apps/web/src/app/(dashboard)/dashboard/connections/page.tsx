@@ -117,7 +117,7 @@ export default function ConnectionsPage() {
 
         {/* List */}
         {isLoading ? (
-          <div className="space-y-3">
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
             {[1, 2].map((i) => (
               <div key={i} className="h-36 animate-pulse rounded-2xl bg-muted/40" />
             ))}
@@ -141,7 +141,7 @@ export default function ConnectionsPage() {
             </button>
           </div>
         ) : (
-          <div className="space-y-3">
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
             {filtered.map((c, i) => (
               <ConnectionCard key={c.id} connection={c} index={i} />
             ))}

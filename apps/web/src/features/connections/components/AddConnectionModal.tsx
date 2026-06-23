@@ -213,7 +213,7 @@ export function AddConnectionModal({ onClose }: Props) {
                         </div>
                         <div>
                             <h2 className="font-semibold">Add Database Connection</h2>
-                            <p className="text-xs text-muted-foreground">Connect a MySQL, MariaDB, PostgreSQL or SQL Server database</p>
+                            <p className="text-xs text-muted-foreground">Connect a database</p>
                         </div>
                     </div>
                     <button
@@ -229,7 +229,7 @@ export function AddConnectionModal({ onClose }: Props) {
                     {/* Database engine */}
                     <div>
                         <label className="block text-sm font-medium mb-1.5">Database Engine</label>
-                        <div className="flex gap-2">
+                        <div className="grid grid-cols-3 gap-2">
                             {([
                                 { value: 'mysql', label: 'MySQL' },
                                 { value: 'mariadb', label: 'MariaDB' },
@@ -243,7 +243,7 @@ export function AddConnectionModal({ onClose }: Props) {
                                     type="button"
                                     onClick={() => handleEngineChange(opt.value)}
                                     className={cn(
-                                        'flex-1 py-1.5 px-3 rounded-lg text-xs font-medium border transition-colors',
+                                        'py-1.5 px-3 rounded-lg text-xs font-medium border transition-colors',
                                         engine === opt.value
                                             ? 'bg-primary text-primary-foreground border-primary'
                                             : 'border-border hover:bg-accent',
