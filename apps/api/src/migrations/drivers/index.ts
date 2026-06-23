@@ -2,6 +2,7 @@ import { DbEngine } from '../../common/db/engine';
 import type { MigrationConn, MigrationDriver } from './migration-driver';
 import { MysqlMigrationDriver } from './mysql-migration.driver';
 import { PostgresMigrationDriver } from './postgres-migration.driver';
+import { SqlServerMigrationDriver } from './sqlserver-migration.driver';
 
 export * from './migration-driver';
 
@@ -11,7 +12,7 @@ export function createMigrationDriver(
   source: MigrationConn,
   target: MigrationConn,
 ): MigrationDriver {
-  return engine === 'postgres'
-    ? new PostgresMigrationDriver(source, target)
-    : new MysqlMigrationDriver(source, target);
+  if (engine === 'postgres') return new PostgresMigrationDriver(source, target);
+  if (engine === 'sqlserver') return new SqlServerMigrationDriver(source, target);
+  return new MysqlMigrationDriver(source, target);
 }

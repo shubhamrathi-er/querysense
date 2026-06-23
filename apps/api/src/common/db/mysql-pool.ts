@@ -1,5 +1,6 @@
 import * as mysql from 'mysql2/promise';
 import { Pool as PgPool } from 'pg';
+import * as mssql from 'mssql';
 import * as net from 'net';
 import { Client } from 'ssh2';
 import { DbEngine } from './engine';
@@ -214,6 +215,60 @@ export async function createPostgresPool(
   return { pool, cleanup };
 }
 
+export interface TunneledMssqlPool {
+  pool: mssql.ConnectionPool;
+  cleanup: () => Promise<void>;
+}
+
+/**
+ * Create a SQL Server (mssql) connection pool, transparently tunnelling through
+ * SSH when configured. Mirrors createMysqlPool(); always pair with cleanup().
+ */
+export async function createSqlServerPool(
+  cfg: PoolConfig,
+): Promise<TunneledMssqlPool> {
+  let tunnel: { host: string; port: number; close: () => Promise<void> } | null =
+    null;
+  let server = cfg.host;
+  let port = cfg.port;
+
+  if (cfg.ssh) {
+    tunnel = await openSshTunnel(cfg.ssh, cfg.host, cfg.port);
+    server = tunnel.host;
+    port = tunnel.port;
+  }
+
+  const pool = new mssql.ConnectionPool({
+    server,
+    port,
+    database: cfg.database,
+    user: cfg.user,
+    password: cfg.password,
+    options: {
+      encrypt: !!cfg.ssl,
+      trustServerCertificate: true,
+    },
+    pool: { max: cfg.connectionLimit ?? 3, min: 0 },
+    connectionTimeout: cfg.connectTimeout ?? 10000,
+    requestTimeout: 30000,
+  });
+  pool.on('error', () => {
+    /* swallow idle-client errors */
+  });
+  await pool.connect();
+
+  const cleanup = async () => {
+    try {
+      await pool.close();
+    } catch {
+      /* ignore */
+    }
+    if (tunnel) await tunnel.close();
+  };
+
+  return { pool, cleanup };
+}
+
 /**
  * Engine-agnostic SQL client. `query()` returns rows directly (normalising the
  * mysql2 `[rows, fields]` tuple vs pg `{ rows }` shape) so call sites that share
@@ -277,6 +332,67 @@ function pgBulkInsert(
   };
 }
 
+/** Bind positional params (@p0, @p1, …) onto an mssql Request, inferring types
+ *  so NULLs, dates, buffers and numbers round-trip correctly. */
+function mssqlBind(req: mssql.Request, params: unknown[]): void {
+  params.forEach((v, i) => {
+    const name = `p${i}`;
+    if (v === null || v === undefined) req.input(name, mssql.NVarChar, null);
+    else if (typeof v === 'boolean') req.input(name, mssql.Bit, v);
+    else if (typeof v === 'bigint') req.input(name, mssql.BigInt, v.toString());
+    else if (typeof v === 'number')
+      Number.isInteger(v)
+        ? req.input(name, mssql.BigInt, v)
+        : req.input(name, mssql.Float, v);
+    else if (v instanceof Date) req.input(name, mssql.DateTime2, v);
+    else if (Buffer.isBuffer(v)) req.input(name, mssql.VarBinary(mssql.MAX), v);
+    else if (typeof v === 'object')
+      req.input(name, mssql.NVarChar(mssql.MAX), JSON.stringify(v));
+    else req.input(name, mssql.NVarChar(mssql.MAX), String(v));
+  });
+}
+
+/** mssql query executor over a request factory; returns the recordset rows. */
+function mssqlExec(makeRequest: () => mssql.Request) {
+  return async <T = Record<string, unknown>>(
+    sql: string,
+    params: unknown[] = [],
+  ): Promise<T[]> => {
+    const req = makeRequest();
+    mssqlBind(req, params);
+    const res = await req.query(sql);
+    return (res.recordset ?? []) as T[];
+  };
+}
+
+/** SQL Server bulk insert. Respects the 1000-row VALUES limit and 2100-param
+ *  cap per statement by sub-chunking. */
+function mssqlBulkInsert(
+  exec: (sql: string, params?: unknown[]) => Promise<unknown>,
+) {
+  return async (table: string, columns: string[], rows: unknown[][]) => {
+    if (rows.length === 0) return 0;
+    const width = Math.max(1, columns.length);
+    const perStmt = Math.max(1, Math.min(1000, Math.floor(2100 / width)));
+    let total = 0;
+    for (let i = 0; i < rows.length; i += perStmt) {
+      const chunk = rows.slice(i, i + perStmt);
+      const tuples = chunk
+        .map(
+          (_, ri) =>
+            `(${columns.map((__, ci) => `@p${ri * width + ci}`).join(', ')})`,
+        )
+        .join(', ');
+      await exec(
+        `INSERT INTO ${table} (${columns.join(', ')}) VALUES ${tuples}`,
+        chunk.flat(),
+      );
+      total += chunk.length;
+    }
+    return total;
+  };
+}
+
 /**
  * Create a normalised SqlClient for the given engine. Note: parameter
  * placeholders are NOT translated — MySQL uses `?`, Postgres uses `$1`. Callers
@@ -321,6 +437,41 @@ export async function createPool(
           throw err;
         } finally {
           client.release();
+        }
+      },
+    };
+  }
+
+  if (engine === 'sqlserver') {
+    const { pool, cleanup } = await createSqlServerPool(cfg);
+    const exec = mssqlExec(() => pool.request());
+    return {
+      engine,
+      query: exec,
+      bulkInsert: mssqlBulkInsert(exec),
+      ping: async () => {
+        await pool.request().query('SELECT 1');
+      },
+      cleanup,
+      transaction: async <T>(fn: (tx: SqlExecutor) => Promise<T>) => {
+        const tx = new mssql.Transaction(pool);
+        await tx.begin();
+        const texec = mssqlExec(() => new mssql.Request(tx));
+        try {
+          const result = await fn({
+            engine,
+            query: texec,
+            bulkInsert: mssqlBulkInsert(texec),
+          });
+          await tx.commit();
+          return result;
+        } catch (err) {
+          try {
+            await tx.rollback();
+          } catch {
+            /* transaction may already be aborted */
+          }
+          throw err;
         }
       },
     };

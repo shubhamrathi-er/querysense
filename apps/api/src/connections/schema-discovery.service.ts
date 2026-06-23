@@ -72,6 +72,8 @@ export interface DiscoveryConfig {
  * model. (A future enhancement could let users pick the schema.)
  */
 const PG_SCHEMA = 'public';
+/** The SQL Server schema we introspect (the conventional default). */
+const SS_SCHEMA = 'dbo';
 
 @Injectable()
 export class SchemaDiscoveryService {
@@ -99,7 +101,9 @@ export class SchemaDiscoveryService {
       const tables =
         engine === 'postgres'
           ? await this.discoverPostgres(client)
-          : await this.discoverMysql(client, config.databaseName);
+          : engine === 'sqlserver'
+            ? await this.discoverSqlServer(client)
+            : await this.discoverMysql(client, config.databaseName);
 
       this.logger.log(
         `Discovered ${tables.length} tables in ${config.databaseName} (${engine})`,
@@ -237,6 +241,64 @@ export class SchemaDiscoveryService {
       WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = $1
     `,
       [PG_SCHEMA],
+    );
+
+    const pkSet = new Set(pkRows.map((r) => `${r.tableName}.${r.columnName}`));
+    return this.assemble(tableRows, columnRows, fkRows, (c) =>
+      pkSet.has(`${c.tableName}.${c.columnName}`),
+    );
+  }
+
+  private async discoverSqlServer(
+    client: SqlClient,
+  ): Promise<DiscoveredTable[]> {
+    const tableRows = await client.query<TableRow>(
+      `SELECT t.TABLE_NAME AS tableName,
+              t.TABLE_TYPE AS tableType,
+              ISNULL((SELECT SUM(p.rows) FROM sys.partitions p
+                      WHERE p.object_id = OBJECT_ID(QUOTENAME(t.TABLE_SCHEMA) + '.' + QUOTENAME(t.TABLE_NAME))
+                        AND p.index_id IN (0, 1)), 0) AS [rowCount],
+              '' AS tableComment
+       FROM INFORMATION_SCHEMA.TABLES t
+       WHERE t.TABLE_SCHEMA = @p0
+       ORDER BY t.TABLE_NAME`,
+      [SS_SCHEMA],
+    );
+    if (tableRows.length === 0) return [];
+
+    const columnRows = await client.query<ColumnRow>(
+      `SELECT c.TABLE_NAME AS tableName,
+              c.COLUMN_NAME AS columnName,
+              c.DATA_TYPE AS dataType,
+              c.IS_NULLABLE AS isNullable,
+              c.ORDINAL_POSITION AS ordinalPosition,
+              '' AS columnComment
+       FROM INFORMATION_SCHEMA.COLUMNS c
+       WHERE c.TABLE_SCHEMA = @p0
+       ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION`,
+      [SS_SCHEMA],
+    );
+
+    const pkRows = await client.query<KeyRow>(
+      `SELECT ku.TABLE_NAME AS tableName, ku.COLUMN_NAME AS columnName
+       FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+       JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE ku
+         ON ku.CONSTRAINT_NAME = tc.CONSTRAINT_NAME AND ku.TABLE_SCHEMA = tc.TABLE_SCHEMA
+       WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' AND tc.TABLE_SCHEMA = @p0`,
+      [SS_SCHEMA],
+    );
+
+    const fkRows = await client.query<ForeignKeyRow>(
+      `SELECT OBJECT_NAME(fk.parent_object_id) AS tableName,
+              pc.name AS columnName,
+              OBJECT_NAME(fk.referenced_object_id) AS referencesTable,
+              rc.name AS referencesColumn
+       FROM sys.foreign_keys fk
+       JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+       JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
+       JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
+       WHERE SCHEMA_NAME(fk.schema_id) = @p0`,
+      [SS_SCHEMA],
     );
 
     const pkSet = new Set(pkRows.map((r) => `${r.tableName}.${r.columnName}`));

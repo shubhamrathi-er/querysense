@@ -231,7 +231,11 @@ export function MigrationWizard({ onClose }: Props) {
             <span className="text-xs text-muted-foreground">
               {(() => {
                 const e = sourceEngine ?? targetEngine;
-                const name = e === 'postgres' ? 'PostgreSQL' : e === 'mysql' ? 'MySQL' : null;
+                const name =
+                  e === 'postgres' ? 'PostgreSQL'
+                  : e === 'sqlserver' ? 'SQL Server'
+                  : e === 'mysql' ? 'MySQL'
+                  : null;
                 return name ? `${name} → ${name}` : 'Same-engine copy';
               })()}
             </span>

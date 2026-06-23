@@ -162,9 +162,9 @@ export class SchemaAuditService {
     });
 
     try {
-      return engine === 'postgres'
-        ? await this.introspectPostgres(client)
-        : await this.introspectMysql(client, connection.databaseName);
+      if (engine === 'postgres') return await this.introspectPostgres(client);
+      if (engine === 'sqlserver') return await this.introspectSqlServer(client);
+      return await this.introspectMysql(client, connection.databaseName);
     } finally {
       await client.cleanup();
     }
@@ -401,6 +401,150 @@ export class SchemaAuditService {
     }
 
     return [...tables.values()];
+  }
+
+  /**
+   * SQL Server equivalent of introspectMysql. Scoped to the `dbo` schema.
+   * engine/collation left null (disables the MySQL-only rules); types mapped to
+   * the MySQL-ish tokens the rules expect; IDENTITY columns marked auto_increment.
+   */
+  private async introspectSqlServer(client: SqlClient): Promise<TableModel[]> {
+    const schema = 'dbo';
+    const tableRows = await client.query<Record<string, unknown>>(
+      `SELECT t.TABLE_NAME AS name,
+              t.TABLE_TYPE AS tableType,
+              ISNULL((SELECT SUM(p.rows) FROM sys.partitions p
+                      WHERE p.object_id = OBJECT_ID(QUOTENAME(t.TABLE_SCHEMA) + '.' + QUOTENAME(t.TABLE_NAME))
+                        AND p.index_id IN (0, 1)), 0) AS [rowCount]
+       FROM INFORMATION_SCHEMA.TABLES t WHERE t.TABLE_SCHEMA = @p0`,
+      [schema],
+    );
+    const colRows = await client.query<Record<string, unknown>>(
+      `SELECT c.TABLE_NAME AS tableName, c.COLUMN_NAME AS columnName,
+              c.DATA_TYPE AS dataType, c.CHARACTER_MAXIMUM_LENGTH AS charLen,
+              c.NUMERIC_PRECISION AS numPrec, c.NUMERIC_SCALE AS numScale,
+              c.IS_NULLABLE AS isNullable,
+              COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsIdentity') AS isIdentity
+       FROM INFORMATION_SCHEMA.COLUMNS c WHERE c.TABLE_SCHEMA = @p0
+       ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION`,
+      [schema],
+    );
+    const pkRows = await client.query<Record<string, unknown>>(
+      `SELECT ku.TABLE_NAME AS tableName, ku.COLUMN_NAME AS columnName
+       FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+       JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE ku
+         ON ku.CONSTRAINT_NAME = tc.CONSTRAINT_NAME AND ku.TABLE_SCHEMA = tc.TABLE_SCHEMA
+       WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' AND tc.TABLE_SCHEMA = @p0`,
+      [schema],
+    );
+    const fkRows = await client.query<Record<string, unknown>>(
+      `SELECT OBJECT_NAME(fk.parent_object_id) AS tableName, pc.name AS columnName
+       FROM sys.foreign_keys fk
+       JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+       JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
+       WHERE SCHEMA_NAME(fk.schema_id) = @p0`,
+      [schema],
+    );
+    const idxRows = await client.query<Record<string, unknown>>(
+      `SELECT t.name AS tableName, i.name AS indexName, i.is_unique AS isUnique,
+              c.name AS columnName, ic.key_ordinal AS seq
+       FROM sys.indexes i
+       JOIN sys.tables t ON t.object_id = i.object_id
+       JOIN sys.schemas s ON s.schema_id = t.schema_id
+       JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+       JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+       WHERE s.name = @p0 AND i.type > 0
+       ORDER BY t.name, i.name, ic.key_ordinal`,
+      [schema],
+    );
+
+    const pkSet = new Set(
+      pkRows.map((r) => `${String(r['tableName'])}.${String(r['columnName'])}`),
+    );
+
+    const tables = new Map<string, TableModel>();
+    for (const r of tableRows) {
+      const name = String(r['name']);
+      tables.set(name, {
+        name,
+        engine: null,
+        collation: null,
+        rowCount: Number(r['rowCount'] ?? 0),
+        isView: String(r['tableType']) === 'VIEW',
+        columns: [],
+        indexes: [],
+        pk: [],
+        fkColumns: new Set(),
+      });
+    }
+
+    for (const r of colRows) {
+      const t = tables.get(String(r['tableName']));
+      if (!t) continue;
+      const name = String(r['columnName']);
+      const dataType = this.mapMssqlType(String(r['dataType']));
+      const isPk = pkSet.has(`${t.name}.${name}`);
+      const charLen = r['charLen'];
+      const columnType =
+        charLen !== null && charLen !== undefined && Number(charLen) > 0
+          ? `${dataType}(${Number(charLen)})`
+          : dataType === 'decimal' && r['numPrec'] != null
+            ? `${dataType}(${Number(r['numPrec'])},${Number(r['numScale'] ?? 0)})`
+            : dataType;
+      const col: ColModel = {
+        name,
+        columnType,
+        dataType,
+        isNullable: String(r['isNullable']).toUpperCase() === 'YES',
+        columnKey: isPk ? 'PRI' : '',
+        extra: Number(r['isIdentity']) === 1 ? 'auto_increment' : '',
+        collation: null,
+      };
+      t.columns.push(col);
+      if (isPk) t.pk.push(name);
+    }
+
+    const idxByTable = new Map<string, Map<string, IndexModel>>();
+    for (const r of idxRows) {
+      const tableName = String(r['tableName']);
+      if (!tables.has(tableName)) continue;
+      const idxName = String(r['indexName']);
+      let byName = idxByTable.get(tableName);
+      if (!byName) {
+        byName = new Map();
+        idxByTable.set(tableName, byName);
+      }
+      let idx = byName.get(idxName);
+      if (!idx) {
+        idx = { name: idxName, columns: [], unique: r['isUnique'] === true };
+        byName.set(idxName, idx);
+      }
+      idx.columns.push(String(r['columnName']));
+    }
+    for (const [tableName, byName] of idxByTable) {
+      const t = tables.get(tableName);
+      if (t) t.indexes = [...byName.values()];
+    }
+
+    for (const r of fkRows) {
+      const t = tables.get(String(r['tableName']));
+      if (t) t.fkColumns.add(String(r['columnName']));
+    }
+
+    return [...tables.values()];
+  }
+
+  /** Map a SQL Server data type to the MySQL-ish token the rules check against. */
+  private mapMssqlType(t: string): string {
+    const v = t.toLowerCase();
+    if (v === 'float') return 'double';
+    if (v === 'real') return 'float';
+    if (v === 'numeric' || v === 'money' || v === 'smallmoney') return 'decimal';
+    if (v === 'nvarchar' || v === 'varchar') return 'varchar';
+    if (v === 'nchar' || v === 'char') return 'char';
+    if (v === 'ntext') return 'text';
+    if (v === 'bit') return 'boolean';
+    return v; // int, bigint, smallint, decimal, text, datetime2, date, etc.
   }
 
   /** Map a Postgres data_type to the MySQL-ish token the rules check against. */

@@ -1,4 +1,4 @@
-export type DatabaseEngine = 'mysql' | 'postgres';
+export type DatabaseEngine = 'mysql' | 'postgres' | 'sqlserver';
 
 export interface Connection {
   id: string;

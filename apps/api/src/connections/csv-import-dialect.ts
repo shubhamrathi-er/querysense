@@ -32,6 +32,18 @@ const PG_TYPE_MAP: Record<string, string> = {
   BOOLEAN: 'BOOLEAN',
 };
 
+const SS_TYPE_MAP: Record<string, string> = {
+  INT: 'INT',
+  BIGINT: 'BIGINT',
+  DOUBLE: 'FLOAT',
+  'DECIMAL(18,4)': 'DECIMAL(18,4)',
+  'VARCHAR(255)': 'NVARCHAR(255)',
+  TEXT: 'NVARCHAR(MAX)',
+  DATE: 'DATE',
+  DATETIME: 'DATETIME2',
+  BOOLEAN: 'BIT',
+};
+
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export interface CsvDialect {
@@ -79,6 +91,18 @@ const postgres: CsvDialect = {
   currentSchemaExpr: () => 'current_schema()',
 };
 
+const sqlserver: CsvDialect = {
+  engine: 'sqlserver',
+  ident: (n) => ident('sqlserver', n),
+  isAllowedType: (t) => CANONICAL_TYPES.has(t),
+  sqlType: (t) => SS_TYPE_MAP[t] ?? t,
+  surrogateKeyDef: () => '[id] BIGINT IDENTITY(1,1) PRIMARY KEY',
+  createTableTail: () => '',
+  currentSchemaExpr: () => 'SCHEMA_NAME()',
+};
+
 export function csvDialect(engine: DbEngine): CsvDialect {
-  return engine === 'postgres' ? postgres : mysql;
+  if (engine === 'postgres') return postgres;
+  if (engine === 'sqlserver') return sqlserver;
+  return mysql;
 }

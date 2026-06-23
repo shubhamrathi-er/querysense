@@ -73,6 +73,33 @@ const postgresDialect: AuditDialect = {
   hasCharsets: false,
 };
 
+const sqlServerDialect: AuditDialect = {
+  engine: 'sqlserver',
+  q: (n) => quoteIdent('sqlserver', n),
+  addIdPk: (t) =>
+    `ALTER TABLE ${quoteIdent('sqlserver', t)} ADD [id] BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY;`,
+  addForeignKey: (t, c, ref) =>
+    `ALTER TABLE ${quoteIdent('sqlserver', t)} ADD CONSTRAINT [fk_${t}_${c}] FOREIGN KEY (${quoteIdent('sqlserver', c)}) REFERENCES ${quoteIdent('sqlserver', ref)}([id]);`,
+  createIndex: (t, c) =>
+    `CREATE INDEX [idx_${t}_${c}] ON ${quoteIdent('sqlserver', t)}(${quoteIdent('sqlserver', c)});`,
+  createUniqueIndex: (t, c) =>
+    `CREATE UNIQUE INDEX [uq_${t}_${c}] ON ${quoteIdent('sqlserver', t)}(${quoteIdent('sqlserver', c)});`,
+  // No ON UPDATE in T-SQL; updated_at maintenance needs a trigger.
+  addTimestamps: (t) =>
+    `ALTER TABLE ${quoteIdent('sqlserver', t)} ADD [created_at] DATETIME2 DEFAULT SYSUTCDATETIME(), [updated_at] DATETIME2 DEFAULT SYSUTCDATETIME();`,
+  setColumnDecimal: (t, c) =>
+    `ALTER TABLE ${quoteIdent('sqlserver', t)} ALTER COLUMN ${quoteIdent('sqlserver', c)} DECIMAL(12,2);`,
+  setColumnBoolean: (t, c) =>
+    `ALTER TABLE ${quoteIdent('sqlserver', t)} ALTER COLUMN ${quoteIdent('sqlserver', c)} BIT;`,
+  widenPkToBigint: (t, c) =>
+    `ALTER TABLE ${quoteIdent('sqlserver', t)} ALTER COLUMN ${quoteIdent('sqlserver', c)} BIGINT;`,
+  booleanTypeLabel: 'BIT',
+  hasStorageEngines: false,
+  hasCharsets: false,
+};
+
 export function auditDialect(engine: DbEngine): AuditDialect {
-  return engine === 'postgres' ? postgresDialect : mysqlDialect;
+  if (engine === 'postgres') return postgresDialect;
+  if (engine === 'sqlserver') return sqlServerDialect;
+  return mysqlDialect;
 }

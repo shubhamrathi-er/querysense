@@ -10,6 +10,7 @@ import { Prisma } from '@prisma/client';
 import {
   createMysqlPool,
   createPostgresPool,
+  createSqlServerPool,
   buildSshConfig,
 } from '../common/db/mysql-pool';
 import { DbEngine, normalizeEngine } from '../common/db/engine';
@@ -846,9 +847,11 @@ export class ConversationsService {
       connectionLimit: 2,
       connectTimeout: 8000,
     };
-    return engine === 'postgres'
-      ? this.executePaginatedPostgres(poolCfg, sql, page, pageSize, offset)
-      : this.executePaginatedMysql(poolCfg, sql, page, pageSize, offset);
+    if (engine === 'postgres')
+      return this.executePaginatedPostgres(poolCfg, sql, page, pageSize, offset);
+    if (engine === 'sqlserver')
+      return this.executePaginatedSqlServer(poolCfg, sql, page, pageSize, offset);
+    return this.executePaginatedMysql(poolCfg, sql, page, pageSize, offset);
   }
 
   private async executePaginatedMysql(
@@ -1006,6 +1009,64 @@ export class ConversationsService {
       };
     } finally {
       client.release();
+      await cleanup();
+    }
+  }
+
+  private async executePaginatedSqlServer(
+    poolCfg: Parameters<typeof createSqlServerPool>[0],
+    sql: string,
+    page: number,
+    pageSize: number,
+    offset: number,
+  ) {
+    const { pool, cleanup } = await createSqlServerPool(poolCfg);
+    const start = Date.now();
+    const fieldsOf = (rs: { columns: Record<string, { name: string }> } | undefined) =>
+      Object.values(rs?.columns ?? {}).map((f) => ({ name: f.name, type: 0 }));
+
+    try {
+      // SQL Server has no cheap row-estimate EXPLAIN; rely on requestTimeout +
+      // paging to bound cost (the COUNT below also fails fast on bad SQL).
+      const countSql = `SELECT COUNT_BIG(*) AS total FROM (${sql}) AS _count_query`;
+      let totalCount = 0;
+      try {
+        const c = await pool.request().query(countSql);
+        totalCount = Number(c.recordset[0]?.['total'] ?? 0);
+      } catch {
+        const res = await pool.request().query(sql);
+        const rows = (res.recordset ?? []) as Record<string, unknown>[];
+        return {
+          rows,
+          fields: fieldsOf(res.recordset),
+          rowCount: rows.length,
+          totalCount: rows.length,
+          page: 1,
+          pageSize: rows.length,
+          totalPages: 1,
+          executionTimeMs: Date.now() - start,
+        };
+      }
+
+      // OFFSET/FETCH requires an ORDER BY; supply a no-op one if the query lacks it.
+      const hasOrderBy = /\border\s+by\b/i.test(sql);
+      const paged = hasOrderBy
+        ? `${sql} OFFSET ${offset} ROWS FETCH NEXT ${pageSize} ROWS ONLY`
+        : `${sql} ORDER BY (SELECT NULL) OFFSET ${offset} ROWS FETCH NEXT ${pageSize} ROWS ONLY`;
+      const res = await pool.request().query(paged);
+      const rows = (res.recordset ?? []) as Record<string, unknown>[];
+
+      return {
+        rows,
+        fields: fieldsOf(res.recordset),
+        rowCount: rows.length,
+        totalCount,
+        page,
+        pageSize,
+        totalPages: Math.ceil(totalCount / pageSize),
+        executionTimeMs: Date.now() - start,
+      };
+    } finally {
       await cleanup();
     }
   }

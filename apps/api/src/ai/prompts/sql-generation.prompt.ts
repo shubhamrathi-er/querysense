@@ -15,6 +15,8 @@ interface DialectGuidance {
   name: string;
   lastMonth: string;
   thisYear: string;
+  /** The row-limit rule (rule 3) — differs because T-SQL has no LIMIT. */
+  limitRule: string;
   extraRules: string[];
 }
 
@@ -24,9 +26,24 @@ function dialectGuidance(engine: DbEngine): DialectGuidance {
       name: 'PostgreSQL',
       lastMonth: `WHERE date_col >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') AND date_col < DATE_TRUNC('month', CURRENT_DATE)`,
       thisYear: `WHERE EXTRACT(YEAR FROM date_col) = EXTRACT(YEAR FROM CURRENT_DATE)`,
+      limitRule:
+        'ALWAYS add LIMIT 500 unless user specifies a limit or asks for aggregations',
       extraRules: [
         `PostgreSQL folds unquoted identifiers to lowercase — double-quote any table/column whose name isn't all-lowercase (e.g. "OrderItems").`,
         `Use ILIKE for case-insensitive text matching.`,
+      ],
+    };
+  }
+  if (engine === 'sqlserver') {
+    return {
+      name: 'SQL Server',
+      lastMonth: `WHERE date_col >= DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0) AND date_col < DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()), 0)`,
+      thisYear: `WHERE YEAR(date_col) = YEAR(GETDATE())`,
+      limitRule:
+        'Do NOT add TOP, OFFSET or FETCH — the system paginates results automatically. Include ORDER BY when ordering matters.',
+      extraRules: [
+        'Quote identifiers with [square brackets] (e.g. [Order Items]).',
+        'T-SQL has no LIMIT; for "top N" use SELECT TOP (N) only when the user explicitly asks for a fixed number.',
       ],
     };
   }
@@ -34,6 +51,8 @@ function dialectGuidance(engine: DbEngine): DialectGuidance {
     name: 'MySQL',
     lastMonth: `WHERE date_col >= DATE_FORMAT(DATE_SUB(NOW(), INTERVAL 1 MONTH), '%Y-%m-01') AND date_col < DATE_FORMAT(NOW(), '%Y-%m-01')`,
     thisYear: `WHERE YEAR(date_col) = YEAR(NOW())`,
+    limitRule:
+      'ALWAYS add LIMIT 500 unless user specifies a limit or asks for aggregations',
     extraRules: [],
   };
 }
@@ -56,7 +75,7 @@ ${params.schemaContext}
 ## STRICT RULES
 1. ONLY use tables and columns that exist in the schema above
 2. ALWAYS use table aliases for clarity (e.g. SELECT u.name FROM users u)
-3. ALWAYS add LIMIT 500 unless user specifies a limit or asks for aggregations
+3. ${d.limitRule}
 4. NEVER use DROP, DELETE, UPDATE, INSERT, TRUNCATE, ALTER, CREATE, or any DDL/DML
 5. For "last month": ${d.lastMonth}
 6. For "this year": ${d.thisYear}

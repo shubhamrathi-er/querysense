@@ -8,6 +8,7 @@ import {
   Table2, Network, MoreVertical,
 } from 'lucide-react';
 import { SiMysql, SiPostgresql } from 'react-icons/si';
+import { DiMsqlServer } from 'react-icons/di';
 import { cn, timeAgo } from '@/lib/utils';
 import { StatusDot, statusTone } from '@/components/ui/status-dot';
 import {
@@ -96,6 +97,8 @@ export function ConnectionCard({ connection, index = 0 }: Props) {
         <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-border bg-white">
           {connection.engine === 'postgres' ? (
             <SiPostgresql className="h-7 w-7" style={{ color: '#336791' }} />
+          ) : connection.engine === 'sqlserver' ? (
+            <DiMsqlServer className="h-7 w-7" style={{ color: '#CC2927' }} />
           ) : (
             <SiMysql className="h-7 w-7" style={{ color: '#00758F' }} />
           )}
@@ -111,7 +114,11 @@ export function ConnectionCard({ connection, index = 0 }: Props) {
           </div>
           <p className="mt-0.5 truncate text-sm text-muted-foreground">
             <span className="font-medium text-foreground/70">
-              {connection.engine === 'postgres' ? 'PostgreSQL' : 'MySQL'}
+              {connection.engine === 'postgres'
+                ? 'PostgreSQL'
+                : connection.engine === 'sqlserver'
+                  ? 'SQL Server'
+                  : 'MySQL'}
             </span>
             {'  ·  '}
             {connection.host}:{connection.port}/{connection.databaseName}

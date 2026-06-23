@@ -110,7 +110,9 @@ export class CsvImportService {
       const rows =
         ctx.engine === 'postgres'
           ? await this.pgImportTargets(ctx)
-          : await this.mysqlImportTargets(ctx);
+          : ctx.engine === 'sqlserver'
+            ? await this.sqlServerImportTargets(ctx)
+            : await this.mysqlImportTargets(ctx);
 
       const byTable = new Map<string, ImportTargetColumn[]>();
       for (const col of rows) {
@@ -197,6 +199,47 @@ export class CsvImportService {
       const charLen = r['charLen'];
       const dataType =
         charLen !== null && charLen !== undefined
+          ? `${String(r['dataType'])}(${Number(charLen)})`
+          : String(r['dataType']);
+      return {
+        tableName: String(r['tableName']),
+        column: {
+          columnName: String(r['columnName']),
+          dataType,
+          isNullable,
+          isAutoIncrement,
+          hasDefault,
+          isRequired: !isNullable && !hasDefault && !isAutoIncrement,
+        } satisfies ImportTargetColumn,
+      };
+    });
+  }
+
+  private async sqlServerImportTargets(ctx: ImportCtx) {
+    const rows = await ctx.client.query<Record<string, unknown>>(
+      `
+      SELECT
+        c.TABLE_NAME AS tableName,
+        c.COLUMN_NAME AS columnName,
+        c.DATA_TYPE AS dataType,
+        c.CHARACTER_MAXIMUM_LENGTH AS charLen,
+        c.IS_NULLABLE AS isNullable,
+        c.COLUMN_DEFAULT AS columnDefault,
+        COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsIdentity') AS isIdentity
+      FROM INFORMATION_SCHEMA.COLUMNS c
+      JOIN INFORMATION_SCHEMA.TABLES t
+        ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME
+      WHERE c.TABLE_SCHEMA = SCHEMA_NAME() AND t.TABLE_TYPE = 'BASE TABLE'
+      ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION
+      `,
+    );
+    return rows.map((r) => {
+      const isNullable = String(r['isNullable']).toUpperCase() === 'YES';
+      const isAutoIncrement = Number(r['isIdentity']) === 1;
+      const hasDefault = r['columnDefault'] !== null || isAutoIncrement;
+      const charLen = r['charLen'];
+      const dataType =
+        charLen !== null && charLen !== undefined && Number(charLen) > 0
           ? `${String(r['dataType'])}(${Number(charLen)})`
           : String(r['dataType']);
       return {
@@ -603,20 +646,27 @@ export class CsvImportService {
 
   // ─── small dialect helpers ───────────────────────────────
 
-  /** Positional placeholder for the engine (`?` for MySQL, `$n` for Postgres). */
+  /** Positional placeholder (`?` MySQL, `$n` Postgres, `@p{n-1}` SQL Server). */
   private ph(ctx: ImportCtx, n: number): string {
-    return ctx.engine === 'postgres' ? `$${n}` : '?';
+    if (ctx.engine === 'postgres') return `$${n}`;
+    if (ctx.engine === 'sqlserver') return `@p${n - 1}`;
+    return '?';
   }
 
   /** information_schema expression that reveals an auto-increment/identity column. */
   private identityExpr(ctx: ImportCtx): string {
-    return ctx.engine === 'postgres' ? 'is_identity' : 'extra';
+    if (ctx.engine === 'postgres') return 'is_identity';
+    if (ctx.engine === 'sqlserver') {
+      return `COLUMNPROPERTY(OBJECT_ID(QUOTENAME(table_schema) + '.' + QUOTENAME(table_name)), column_name, 'IsIdentity')`;
+    }
+    return 'extra';
   }
 
   private isAutoFlag(ctx: ImportCtx, value: unknown): boolean {
     if (ctx.engine === 'postgres') {
       return String(value ?? '').toUpperCase() === 'YES';
     }
+    if (ctx.engine === 'sqlserver') return Number(value) === 1;
     return String(value ?? '')
       .toLowerCase()
       .includes('auto_increment');
@@ -642,8 +692,28 @@ export class CsvImportService {
       };
     }
 
-    // Postgres: explicit positional placeholders.
     const width = escKeyCols.length;
+    if (ctx.engine === 'sqlserver') {
+      // T-SQL has no row-value IN; use OR-of-ANDs with @pN placeholders.
+      if (width === 1) {
+        const placeholders = chunk.map((_, i) => `@p${i}`).join(', ');
+        return {
+          whereSql: `${escKeyCols[0]} IN (${placeholders})`,
+          params: chunk.map((t) => t[0]),
+        };
+      }
+      const ors = chunk
+        .map(
+          (_, ri) =>
+            `(${escKeyCols
+              .map((c, ci) => `${c} = @p${ri * width + ci}`)
+              .join(' AND ')})`,
+        )
+        .join(' OR ');
+      return { whereSql: ors, params: chunk.flat() };
+    }
+
+    // Postgres: explicit positional placeholders.
     if (width === 1) {
       const placeholders = chunk.map((_, i) => `$${i + 1}`).join(', ');
       return {

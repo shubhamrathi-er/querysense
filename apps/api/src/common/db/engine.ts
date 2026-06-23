@@ -5,14 +5,19 @@
  * engine via small dialect helpers instead of scattering `if (engine === ...)`.
  */
 
-export type DbEngine = 'mysql' | 'postgres';
+export type DbEngine = 'mysql' | 'postgres' | 'sqlserver';
 
-export const DB_ENGINES: readonly DbEngine[] = ['mysql', 'postgres'] as const;
+export const DB_ENGINES: readonly DbEngine[] = [
+  'mysql',
+  'postgres',
+  'sqlserver',
+] as const;
 
 /** Default TCP port per engine, applied when the user omits one. */
 export const DEFAULT_PORTS: Record<DbEngine, number> = {
   mysql: 3306,
   postgres: 5432,
+  sqlserver: 1433,
 };
 
 /**
@@ -22,13 +27,16 @@ export const DEFAULT_PORTS: Record<DbEngine, number> = {
 export function normalizeEngine(value: string | null | undefined): DbEngine {
   const v = (value ?? '').trim().toLowerCase();
   if (v === 'postgres' || v === 'postgresql' || v === 'pg') return 'postgres';
+  if (v === 'sqlserver' || v === 'mssql' || v === 'sql_server' || v === 'sqlsrv') {
+    return 'sqlserver';
+  }
   return 'mysql';
 }
 
 /**
  * Quote an identifier for the given engine. MySQL uses backticks; PostgreSQL
- * uses double quotes (with `"` escaped by doubling). Rejects characters that
- * can't be safely escaped for the engine.
+ * uses double quotes; SQL Server uses [brackets] (with `]` escaped by doubling).
+ * Rejects characters that can't be safely escaped for the engine.
  */
 export function quoteIdent(engine: DbEngine, name: string): string {
   if (name.includes('\0')) {
@@ -37,6 +45,9 @@ export function quoteIdent(engine: DbEngine, name: string): string {
   if (engine === 'postgres') {
     return `"${name.replace(/"/g, '""')}"`;
   }
+  if (engine === 'sqlserver') {
+    return `[${name.replace(/]/g, ']]')}]`;
+  }
   if (name.includes('`')) {
     throw new Error('MySQL identifier cannot contain a backtick');
   }
@@ -44,6 +55,10 @@ export function quoteIdent(engine: DbEngine, name: string): string {
 }
 
 /** The dialect string node-sql-parser expects for this engine. */
-export function parserDialect(engine: DbEngine): 'MySQL' | 'PostgreSQL' {
-  return engine === 'postgres' ? 'PostgreSQL' : 'MySQL';
+export function parserDialect(
+  engine: DbEngine,
+): 'MySQL' | 'PostgreSQL' | 'transactsql' {
+  if (engine === 'postgres') return 'PostgreSQL';
+  if (engine === 'sqlserver') return 'transactsql';
+  return 'MySQL';
 }

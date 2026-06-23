@@ -3,6 +3,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { EncryptionService } from '../../common/encryption/encryption.service';
 import { MysqlAdapter } from './dialect/mysql.adapter';
 import { PostgresAdapter } from './dialect/postgres.adapter';
+import { SqlServerAdapter } from './dialect/sqlserver.adapter';
 import { buildSshConfig } from '../../common/db/mysql-pool';
 import { normalizeEngine } from '../../common/db/engine';
 import type { DialectAdapter, FkDetail } from './dialect/dialect-adapter.interface';
@@ -499,9 +500,10 @@ export class MigrationValidationService {
       sslEnabled: c.sslEnabled,
       ssh: buildSshConfig(c, (s) => this.encryption.decrypt(s)),
     };
-    return normalizeEngine(c.engine) === 'postgres'
-      ? new PostgresAdapter(cfg)
-      : new MysqlAdapter(cfg);
+    const engine = normalizeEngine(c.engine);
+    if (engine === 'postgres') return new PostgresAdapter(cfg);
+    if (engine === 'sqlserver') return new SqlServerAdapter(cfg);
+    return new MysqlAdapter(cfg);
   }
 }
 
