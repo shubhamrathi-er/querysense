@@ -11,6 +11,7 @@ import {
   createMysqlPool,
   createPostgresPool,
   createSqlServerPool,
+  createSnowflakePool,
   buildSshConfig,
 } from '../common/db/mysql-pool';
 import { DbEngine, normalizeEngine } from '../common/db/engine';
@@ -853,6 +854,8 @@ export class ConversationsService {
       return this.executePaginatedRedshift(poolCfg, sql, page, pageSize, offset);
     if (engine === 'sqlserver')
       return this.executePaginatedSqlServer(poolCfg, sql, page, pageSize, offset);
+    if (engine === 'snowflake')
+      return this.executePaginatedSnowflake(poolCfg, sql, page, pageSize, offset);
     return this.executePaginatedMysql(poolCfg, sql, page, pageSize, offset);
   }
 
@@ -1126,6 +1129,55 @@ export class ConversationsService {
       };
     } finally {
       await cleanup();
+    }
+  }
+
+  private async executePaginatedSnowflake(
+    poolCfg: Parameters<typeof createSnowflakePool>[0],
+    sql: string,
+    page: number,
+    pageSize: number,
+    offset: number,
+  ) {
+    const sf = await createSnowflakePool(poolCfg);
+    const start = Date.now();
+    const fieldsOf = (rows: Record<string, unknown>[]) =>
+      rows[0] ? Object.keys(rows[0]).map((name) => ({ name, type: 0 })) : [];
+    try {
+      let totalCount = 0;
+      try {
+        const c = await sf.execute<{ total: number }>(
+          `SELECT COUNT(*) AS "total" FROM (${sql}) AS _count_query`,
+        );
+        totalCount = Number(c[0]?.total ?? 0);
+      } catch {
+        const rows = await sf.execute<Record<string, unknown>>(sql);
+        return {
+          rows,
+          fields: fieldsOf(rows),
+          rowCount: rows.length,
+          totalCount: rows.length,
+          page: 1,
+          pageSize: rows.length,
+          totalPages: 1,
+          executionTimeMs: Date.now() - start,
+        };
+      }
+      const rows = await sf.execute<Record<string, unknown>>(
+        `${sql} LIMIT ${pageSize} OFFSET ${offset}`,
+      );
+      return {
+        rows,
+        fields: fieldsOf(rows),
+        rowCount: rows.length,
+        totalCount,
+        page,
+        pageSize,
+        totalPages: Math.ceil(totalCount / pageSize),
+        executionTimeMs: Date.now() - start,
+      };
+    } finally {
+      await sf.cleanup();
     }
   }
 

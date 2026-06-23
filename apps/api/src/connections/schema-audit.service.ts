@@ -9,7 +9,12 @@ import {
   type SqlClient,
   buildSshConfig,
 } from '../common/db/mysql-pool';
-import { DbEngine, normalizeEngine } from '../common/db/engine';
+import {
+  DbEngine,
+  normalizeEngine,
+  isConnectQueryOnly,
+  ENGINE_LABELS,
+} from '../common/db/engine';
 import { AuditDialect, auditDialect } from './audit-dialect';
 import { PrismaService } from '../../prisma/prisma.service';
 import { EncryptionService } from '../common/encryption/encryption.service';
@@ -91,9 +96,9 @@ export class SchemaAuditService {
     if (!connection) throw new NotFoundException('Connection not found');
 
     const engine = normalizeEngine(connection.engine);
-    if (engine === 'redshift') {
+    if (isConnectQueryOnly(engine)) {
       throw new BadRequestException(
-        'Schema audit is not yet supported for Amazon Redshift connections.',
+        `Schema audit is not yet supported for ${ENGINE_LABELS[engine]} connections.`,
       );
     }
     const dialect = auditDialect(engine);

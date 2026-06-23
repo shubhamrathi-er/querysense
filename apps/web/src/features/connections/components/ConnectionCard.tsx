@@ -7,7 +7,7 @@ import {
   RefreshCw, Trash2, CheckCircle2, Clock, Loader2,
   Table2, Network, MoreVertical,
 } from 'lucide-react';
-import { SiMysql, SiPostgresql, SiMariadb } from 'react-icons/si';
+import { SiMysql, SiPostgresql, SiMariadb, SiSnowflake } from 'react-icons/si';
 import { DiMsqlServer, DiAws } from 'react-icons/di';
 import { cn, timeAgo } from '@/lib/utils';
 import { StatusDot, statusTone } from '@/components/ui/status-dot';
@@ -103,6 +103,8 @@ export function ConnectionCard({ connection, index = 0 }: Props) {
             <SiMariadb className="h-7 w-7" style={{ color: '#003545' }} />
           ) : connection.engine === 'redshift' ? (
             <DiAws className="h-7 w-7" style={{ color: '#C73A36' }} />
+          ) : connection.engine === 'snowflake' ? (
+            <SiSnowflake className="h-7 w-7" style={{ color: '#29B5E8' }} />
           ) : (
             <SiMysql className="h-7 w-7" style={{ color: '#00758F' }} />
           )}
@@ -126,7 +128,9 @@ export function ConnectionCard({ connection, index = 0 }: Props) {
                     ? 'MariaDB'
                     : connection.engine === 'redshift'
                       ? 'Redshift'
-                      : 'MySQL'}
+                      : connection.engine === 'snowflake'
+                        ? 'Snowflake'
+                        : 'MySQL'}
             </span>
             {'  ·  '}
             {connection.host}:{connection.port}/{connection.databaseName}

@@ -11,7 +11,13 @@ import {
   type SqlExecutor,
   buildSshConfig,
 } from '../common/db/mysql-pool';
-import { DbEngine, normalizeEngine, isMysqlFamily } from '../common/db/engine';
+import {
+  DbEngine,
+  normalizeEngine,
+  isMysqlFamily,
+  isConnectQueryOnly,
+  ENGINE_LABELS,
+} from '../common/db/engine';
 import { CsvDialect, csvDialect } from './csv-import-dialect';
 import { PrismaService } from '../../prisma/prisma.service';
 import { EncryptionService } from '../common/encryption/encryption.service';
@@ -76,9 +82,9 @@ export class CsvImportService {
     if (!connection) throw new NotFoundException('Connection not found');
 
     const engine = normalizeEngine(connection.engine);
-    if (engine === 'redshift') {
+    if (isConnectQueryOnly(engine)) {
       throw new BadRequestException(
-        'CSV import is not yet supported for Amazon Redshift connections.',
+        `CSV import is not yet supported for ${ENGINE_LABELS[engine]} connections.`,
       );
     }
     const client = await createPool(engine, {

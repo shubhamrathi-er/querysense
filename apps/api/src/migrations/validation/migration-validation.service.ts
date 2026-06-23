@@ -10,7 +10,11 @@ import { MysqlAdapter } from './dialect/mysql.adapter';
 import { PostgresAdapter } from './dialect/postgres.adapter';
 import { SqlServerAdapter } from './dialect/sqlserver.adapter';
 import { buildSshConfig } from '../../common/db/mysql-pool';
-import { normalizeEngine } from '../../common/db/engine';
+import {
+  normalizeEngine,
+  isConnectQueryOnly,
+  ENGINE_LABELS,
+} from '../../common/db/engine';
 import type { DialectAdapter, FkDetail } from './dialect/dialect-adapter.interface';
 import {
   Severity,
@@ -506,9 +510,9 @@ export class MigrationValidationService {
       ssh: buildSshConfig(c, (s) => this.encryption.decrypt(s)),
     };
     const engine = normalizeEngine(c.engine);
-    if (engine === 'redshift') {
+    if (isConnectQueryOnly(engine)) {
       throw new BadRequestException(
-        'Migration validation is not yet supported for Amazon Redshift connections.',
+        `Migration validation is not yet supported for ${ENGINE_LABELS[engine]} connections.`,
       );
     }
     if (engine === 'postgres') return new PostgresAdapter(cfg);

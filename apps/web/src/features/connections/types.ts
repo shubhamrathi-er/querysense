@@ -3,7 +3,8 @@ export type DatabaseEngine =
   | 'mariadb'
   | 'postgres'
   | 'redshift'
-  | 'sqlserver';
+  | 'sqlserver'
+  | 'snowflake';
 
 export interface Connection {
   id: string;

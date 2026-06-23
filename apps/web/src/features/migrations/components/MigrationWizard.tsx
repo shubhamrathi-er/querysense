@@ -39,9 +39,13 @@ const SEV_COLOR: Record<Severity, string> = {
 export function MigrationWizard({ onClose }: Props) {
   const { data: connections } = useConnections();
   const { currentWorkspace } = useWorkspaceStore();
-  // Redshift connections are excluded — data migration isn't supported for them yet.
+  // Connect/query-only engines (Redshift, Snowflake) are excluded — data
+  // migration isn't supported for them yet.
   const active = (connections ?? []).filter(
-    (c) => c.status === 'ACTIVE' && c.engine !== 'redshift',
+    (c) =>
+      c.status === 'ACTIVE' &&
+      c.engine !== 'redshift' &&
+      c.engine !== 'snowflake',
   );
 
   const [step, setStep] = useState<Step>('select');

@@ -47,6 +47,19 @@ function dialectGuidance(engine: DbEngine): DialectGuidance {
       ],
     };
   }
+  if (engine === 'snowflake') {
+    return {
+      name: 'Snowflake',
+      lastMonth: `WHERE date_col >= DATE_TRUNC('month', DATEADD('month', -1, CURRENT_DATE())) AND date_col < DATE_TRUNC('month', CURRENT_DATE())`,
+      thisYear: `WHERE YEAR(date_col) = YEAR(CURRENT_DATE())`,
+      limitRule:
+        'ALWAYS add LIMIT 500 unless user specifies a limit or asks for aggregations',
+      extraRules: [
+        `Snowflake folds unquoted identifiers to UPPERCASE — double-quote any identifier that must keep its case.`,
+        `Use ILIKE for case-insensitive text matching.`,
+      ],
+    };
+  }
   if (engine === 'sqlserver') {
     return {
       name: 'SQL Server',

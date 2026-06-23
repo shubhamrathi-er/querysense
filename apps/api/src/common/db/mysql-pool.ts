@@ -1,6 +1,7 @@
 import * as mysql from 'mysql2/promise';
 import { Pool as PgPool } from 'pg';
 import * as mssql from 'mssql';
+import * as snowflake from 'snowflake-sdk';
 import * as net from 'net';
 import { Client } from 'ssh2';
 import { DbEngine } from './engine';
@@ -269,6 +270,49 @@ export async function createSqlServerPool(
   return { pool, cleanup };
 }
 
+export interface SnowflakeHandle {
+  execute<T = Record<string, unknown>>(
+    sqlText: string,
+    binds?: unknown[],
+  ): Promise<T[]>;
+  cleanup: () => Promise<void>;
+}
+
+/**
+ * Connect to Snowflake via its account identifier (stored in cfg.host). Uses a
+ * single connection (no SSH); warehouse/schema/role come from the user's
+ * defaults. Connect/query only — no bulk insert or transactions are wired.
+ */
+export async function createSnowflakePool(
+  cfg: PoolConfig,
+): Promise<SnowflakeHandle> {
+  const conn = snowflake.createConnection({
+    account: cfg.host,
+    username: cfg.user,
+    password: cfg.password,
+    database: cfg.database,
+    application: 'querysense',
+  });
+  await new Promise<void>((resolve, reject) =>
+    conn.connect((err) => (err ? reject(err) : resolve())),
+  );
+
+  const execute = <T>(sqlText: string, binds: unknown[] = []) =>
+    new Promise<T[]>((resolve, reject) => {
+      conn.execute({
+        sqlText,
+        binds: binds as snowflake.Binds,
+        complete: (err, _stmt, rows) =>
+          err ? reject(err) : resolve((rows ?? []) as T[]),
+      });
+    });
+
+  const cleanup = () =>
+    new Promise<void>((resolve) => conn.destroy(() => resolve()));
+
+  return { execute, cleanup };
+}
+
 /**
  * Engine-agnostic SQL client. `query()` returns rows directly (normalising the
  * mysql2 `[rows, fields]` tuple vs pg `{ rows }` shape) so call sites that share
@@ -440,6 +484,25 @@ export async function createPool(
           client.release();
         }
       },
+    };
+  }
+
+  if (engine === 'snowflake') {
+    const sf = await createSnowflakePool(cfg);
+    const unsupported = (): never => {
+      throw new Error(
+        'This operation is not supported for Snowflake (connect/query only).',
+      );
+    };
+    return {
+      engine,
+      query: <T>(sql: string, params?: unknown[]) => sf.execute<T>(sql, params),
+      bulkInsert: () => Promise.reject(unsupported()),
+      ping: async () => {
+        await sf.execute('SELECT 1');
+      },
+      cleanup: sf.cleanup,
+      transaction: () => Promise.reject(unsupported()),
     };
   }
 

@@ -6,7 +6,12 @@ import {
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { buildSshConfig, type SshConfig } from '../common/db/mysql-pool';
-import { DbEngine, normalizeEngine } from '../common/db/engine';
+import {
+  DbEngine,
+  normalizeEngine,
+  isConnectQueryOnly,
+  ENGINE_LABELS,
+} from '../common/db/engine';
 import {
   createMigrationDriver,
   SCRIPT_ROW_CAP,
@@ -315,9 +320,9 @@ export class DataMigrationService {
           `Source and target must use the same database engine.`,
       );
     }
-    if (source.engine === 'redshift') {
+    if (isConnectQueryOnly(source.engine)) {
       throw new BadRequestException(
-        'Data migration is not yet supported for Amazon Redshift connections.',
+        `Data migration is not yet supported for ${ENGINE_LABELS[source.engine]} connections.`,
       );
     }
     return source.engine;

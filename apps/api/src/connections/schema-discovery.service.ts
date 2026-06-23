@@ -103,9 +103,11 @@ export class SchemaDiscoveryService {
           ? await this.discoverPostgres(client)
           : engine === 'redshift'
             ? await this.discoverRedshift(client)
-            : engine === 'sqlserver'
-              ? await this.discoverSqlServer(client)
-              : await this.discoverMysql(client, config.databaseName);
+            : engine === 'snowflake'
+              ? await this.discoverSnowflake(client)
+              : engine === 'sqlserver'
+                ? await this.discoverSqlServer(client)
+                : await this.discoverMysql(client, config.databaseName);
 
       this.logger.log(
         `Discovered ${tables.length} tables in ${config.databaseName} (${engine})`,
@@ -370,6 +372,41 @@ export class SchemaDiscoveryService {
     return this.assemble(tableRows, columnRows, fkRows, (c) =>
       pkSet.has(`${c.tableName}.${c.columnName}`),
     );
+  }
+
+  /**
+   * Snowflake discovery via INFORMATION_SCHEMA (scoped to the PUBLIC schema).
+   * Primary/foreign keys are omitted — Snowflake exposes key columns only via
+   * SHOW commands and its constraints are informational/unenforced.
+   */
+  private async discoverSnowflake(client: SqlClient): Promise<DiscoveredTable[]> {
+    const schema = 'PUBLIC';
+    const tableRows = await client.query<TableRow>(
+      `SELECT TABLE_NAME AS "tableName",
+              TABLE_TYPE AS "tableType",
+              COALESCE(ROW_COUNT, 0) AS "rowCount",
+              COALESCE(COMMENT, '') AS "tableComment"
+       FROM INFORMATION_SCHEMA.TABLES
+       WHERE TABLE_SCHEMA = ?
+       ORDER BY TABLE_NAME`,
+      [schema],
+    );
+    if (tableRows.length === 0) return [];
+
+    const columnRows = await client.query<ColumnRow>(
+      `SELECT TABLE_NAME AS "tableName",
+              COLUMN_NAME AS "columnName",
+              DATA_TYPE AS "dataType",
+              IS_NULLABLE AS "isNullable",
+              ORDINAL_POSITION AS "ordinalPosition",
+              COALESCE(COMMENT, '') AS "columnComment"
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = ?
+       ORDER BY TABLE_NAME, ORDINAL_POSITION`,
+      [schema],
+    );
+
+    return this.assemble(tableRows, columnRows, [], () => false);
   }
 
   /** Shared assembly of the per-engine row sets into DiscoveredTable[]. */
