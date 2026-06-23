@@ -315,6 +315,11 @@ export class DataMigrationService {
           `Source and target must use the same database engine.`,
       );
     }
+    if (source.engine === 'redshift') {
+      throw new BadRequestException(
+        'Data migration is not yet supported for Amazon Redshift connections.',
+      );
+    }
     return source.engine;
   }
 

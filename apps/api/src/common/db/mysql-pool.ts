@@ -403,7 +403,8 @@ export async function createPool(
   engine: DbEngine,
   cfg: PoolConfig,
 ): Promise<SqlClient> {
-  if (engine === 'postgres') {
+  if (engine === 'postgres' || engine === 'redshift') {
+    // Redshift is PostgreSQL wire-compatible, so it uses the same pg driver.
     const { pool, cleanup } = await createPostgresPool(cfg);
     const query = async <T>(sql: string, params?: unknown[]) =>
       (await pool.query(sql, params)).rows as T[];

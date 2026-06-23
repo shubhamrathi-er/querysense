@@ -7,8 +7,8 @@ import {
   RefreshCw, Trash2, CheckCircle2, Clock, Loader2,
   Table2, Network, MoreVertical,
 } from 'lucide-react';
-import { SiMysql, SiPostgresql } from 'react-icons/si';
-import { DiMsqlServer } from 'react-icons/di';
+import { SiMysql, SiPostgresql, SiMariadb } from 'react-icons/si';
+import { DiMsqlServer, DiAws } from 'react-icons/di';
 import { cn, timeAgo } from '@/lib/utils';
 import { StatusDot, statusTone } from '@/components/ui/status-dot';
 import {
@@ -99,6 +99,10 @@ export function ConnectionCard({ connection, index = 0 }: Props) {
             <SiPostgresql className="h-7 w-7" style={{ color: '#336791' }} />
           ) : connection.engine === 'sqlserver' ? (
             <DiMsqlServer className="h-7 w-7" style={{ color: '#CC2927' }} />
+          ) : connection.engine === 'mariadb' ? (
+            <SiMariadb className="h-7 w-7" style={{ color: '#003545' }} />
+          ) : connection.engine === 'redshift' ? (
+            <DiAws className="h-7 w-7" style={{ color: '#C73A36' }} />
           ) : (
             <SiMysql className="h-7 w-7" style={{ color: '#00758F' }} />
           )}
@@ -118,7 +122,11 @@ export function ConnectionCard({ connection, index = 0 }: Props) {
                 ? 'PostgreSQL'
                 : connection.engine === 'sqlserver'
                   ? 'SQL Server'
-                  : 'MySQL'}
+                  : connection.engine === 'mariadb'
+                    ? 'MariaDB'
+                    : connection.engine === 'redshift'
+                      ? 'Redshift'
+                      : 'MySQL'}
             </span>
             {'  ·  '}
             {connection.host}:{connection.port}/{connection.databaseName}

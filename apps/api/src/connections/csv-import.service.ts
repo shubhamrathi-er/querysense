@@ -11,7 +11,7 @@ import {
   type SqlExecutor,
   buildSshConfig,
 } from '../common/db/mysql-pool';
-import { DbEngine, normalizeEngine } from '../common/db/engine';
+import { DbEngine, normalizeEngine, isMysqlFamily } from '../common/db/engine';
 import { CsvDialect, csvDialect } from './csv-import-dialect';
 import { PrismaService } from '../../prisma/prisma.service';
 import { EncryptionService } from '../common/encryption/encryption.service';
@@ -76,6 +76,11 @@ export class CsvImportService {
     if (!connection) throw new NotFoundException('Connection not found');
 
     const engine = normalizeEngine(connection.engine);
+    if (engine === 'redshift') {
+      throw new BadRequestException(
+        'CSV import is not yet supported for Amazon Redshift connections.',
+      );
+    }
     const client = await createPool(engine, {
       host: connection.host,
       port: connection.port,
@@ -625,7 +630,7 @@ export class CsvImportService {
           // aborts the transaction on the first error, so we can only report the
           // chunk range there.
           let rowNum = i + 1;
-          if (ctx.engine === 'mysql') {
+          if (isMysqlFamily(ctx.engine)) {
             for (let j = 0; j < chunk.length; j++) {
               try {
                 await tx.bulkInsert(escTable, escCols, [toRowValues(chunk[j])]);
@@ -678,7 +683,7 @@ export class CsvImportService {
     escKeyCols: string[],
     chunk: (string | null)[][],
   ): { whereSql: string; params: unknown[] } {
-    if (ctx.engine === 'mysql') {
+    if (isMysqlFamily(ctx.engine)) {
       // mysql2 expands a nested array for IN (?).
       if (escKeyCols.length === 1) {
         return {

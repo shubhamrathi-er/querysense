@@ -15,12 +15,12 @@ import { useCreateConnection } from '../hooks/useConnections';
 import { useWorkspaceStore } from '@/stores/workspace.store';
 import type { SshConnectionInput } from '../types';
 
-const ENGINE_PORTS = { mysql: 3306, postgres: 5432, sqlserver: 1433 } as const;
+const ENGINE_PORTS = { mysql: 3306, mariadb: 3306, postgres: 5432, redshift: 5439, sqlserver: 1433 } as const;
 
 const schema = z
     .object({
         name: z.string().min(2, 'Name must be at least 2 characters'),
-        engine: z.enum(['mysql', 'postgres', 'sqlserver']),
+        engine: z.enum(['mysql', 'mariadb', 'postgres', 'redshift', 'sqlserver']),
         host: z.string().min(1, 'Host is required'),
         port: z.number().min(1).max(65535),
         databaseName: z.string().min(1, 'Database name is required'),
@@ -143,7 +143,7 @@ export function AddConnectionModal({ onClose }: Props) {
 
     // Switch the engine, and move the port to the new engine's default if it was
     // still on the previous engine's default (don't clobber a custom port).
-    const handleEngineChange = (next: 'mysql' | 'postgres' | 'sqlserver') => {
+    const handleEngineChange = (next: 'mysql' | 'mariadb' | 'postgres' | 'redshift' | 'sqlserver') => {
         const current = getValues('port');
         if (current === ENGINE_PORTS[engine]) {
             setValue('port', ENGINE_PORTS[next]);
@@ -213,7 +213,7 @@ export function AddConnectionModal({ onClose }: Props) {
                         </div>
                         <div>
                             <h2 className="font-semibold">Add Database Connection</h2>
-                            <p className="text-xs text-muted-foreground">Connect a MySQL, PostgreSQL or SQL Server database</p>
+                            <p className="text-xs text-muted-foreground">Connect a MySQL, MariaDB, PostgreSQL or SQL Server database</p>
                         </div>
                     </div>
                     <button
@@ -232,7 +232,9 @@ export function AddConnectionModal({ onClose }: Props) {
                         <div className="flex gap-2">
                             {([
                                 { value: 'mysql', label: 'MySQL' },
+                                { value: 'mariadb', label: 'MariaDB' },
                                 { value: 'postgres', label: 'PostgreSQL' },
+                                { value: 'redshift', label: 'Redshift' },
                                 { value: 'sqlserver', label: 'SQL Server' },
                             ] as const).map((opt) => (
                                 <button

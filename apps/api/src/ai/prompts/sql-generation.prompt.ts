@@ -34,6 +34,19 @@ function dialectGuidance(engine: DbEngine): DialectGuidance {
       ],
     };
   }
+  if (engine === 'redshift') {
+    return {
+      name: 'Amazon Redshift',
+      lastMonth: `WHERE date_col >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') AND date_col < DATE_TRUNC('month', CURRENT_DATE)`,
+      thisYear: `WHERE EXTRACT(YEAR FROM date_col) = EXTRACT(YEAR FROM CURRENT_DATE)`,
+      limitRule:
+        'ALWAYS add LIMIT 500 unless user specifies a limit or asks for aggregations',
+      extraRules: [
+        `Redshift folds unquoted identifiers to lowercase — double-quote any identifier that isn't all-lowercase.`,
+        `Use ILIKE for case-insensitive text matching.`,
+      ],
+    };
+  }
   if (engine === 'sqlserver') {
     return {
       name: 'SQL Server',

@@ -101,9 +101,11 @@ export class SchemaDiscoveryService {
       const tables =
         engine === 'postgres'
           ? await this.discoverPostgres(client)
-          : engine === 'sqlserver'
-            ? await this.discoverSqlServer(client)
-            : await this.discoverMysql(client, config.databaseName);
+          : engine === 'redshift'
+            ? await this.discoverRedshift(client)
+            : engine === 'sqlserver'
+              ? await this.discoverSqlServer(client)
+              : await this.discoverMysql(client, config.databaseName);
 
       this.logger.log(
         `Discovered ${tables.length} tables in ${config.databaseName} (${engine})`,
@@ -299,6 +301,69 @@ export class SchemaDiscoveryService {
        JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
        WHERE SCHEMA_NAME(fk.schema_id) = @p0`,
       [SS_SCHEMA],
+    );
+
+    const pkSet = new Set(pkRows.map((r) => `${r.tableName}.${r.columnName}`));
+    return this.assemble(tableRows, columnRows, fkRows, (c) =>
+      pkSet.has(`${c.tableName}.${c.columnName}`),
+    );
+  }
+
+  /**
+   * Amazon Redshift discovery. Redshift is Postgres-wire but lacks pg_stat /
+   * obj_description and several pg_catalog functions, so this uses only the
+   * standard information_schema (row counts and comments are omitted).
+   */
+  private async discoverRedshift(client: SqlClient): Promise<DiscoveredTable[]> {
+    const tableRows = await client.query<TableRow>(
+      `SELECT table_name AS "tableName",
+              table_type AS "tableType",
+              0 AS "rowCount",
+              '' AS "tableComment"
+       FROM information_schema.tables
+       WHERE table_schema = $1
+       ORDER BY table_name`,
+      [PG_SCHEMA],
+    );
+    if (tableRows.length === 0) return [];
+
+    const columnRows = await client.query<ColumnRow>(
+      `SELECT table_name AS "tableName",
+              column_name AS "columnName",
+              data_type AS "dataType",
+              is_nullable AS "isNullable",
+              ordinal_position AS "ordinalPosition",
+              '' AS "columnComment"
+       FROM information_schema.columns
+       WHERE table_schema = $1
+       ORDER BY table_name, ordinal_position`,
+      [PG_SCHEMA],
+    );
+
+    const pkRows = await client.query<KeyRow>(
+      `SELECT kcu.table_name AS "tableName", kcu.column_name AS "columnName"
+       FROM information_schema.table_constraints tc
+       JOIN information_schema.key_column_usage kcu
+         ON kcu.constraint_name = tc.constraint_name
+        AND kcu.table_schema = tc.table_schema
+       WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1`,
+      [PG_SCHEMA],
+    );
+
+    const fkRows = await client.query<ForeignKeyRow>(
+      `SELECT kcu.table_name AS "tableName",
+              kcu.column_name AS "columnName",
+              ccu.table_name AS "referencesTable",
+              ccu.column_name AS "referencesColumn"
+       FROM information_schema.table_constraints tc
+       JOIN information_schema.key_column_usage kcu
+         ON kcu.constraint_name = tc.constraint_name
+        AND kcu.table_schema = tc.table_schema
+       JOIN information_schema.constraint_column_usage ccu
+         ON ccu.constraint_name = tc.constraint_name
+        AND ccu.table_schema = tc.table_schema
+       WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = $1`,
+      [PG_SCHEMA],
     );
 
     const pkSet = new Set(pkRows.map((r) => `${r.tableName}.${r.columnName}`));

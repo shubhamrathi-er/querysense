@@ -5,20 +5,39 @@
  * engine via small dialect helpers instead of scattering `if (engine === ...)`.
  */
 
-export type DbEngine = 'mysql' | 'postgres' | 'sqlserver';
+export type DbEngine =
+  | 'mysql'
+  | 'mariadb'
+  | 'postgres'
+  | 'redshift'
+  | 'sqlserver';
 
 export const DB_ENGINES: readonly DbEngine[] = [
   'mysql',
+  'mariadb',
   'postgres',
+  'redshift',
   'sqlserver',
 ] as const;
 
 /** Default TCP port per engine, applied when the user omits one. */
 export const DEFAULT_PORTS: Record<DbEngine, number> = {
   mysql: 3306,
+  mariadb: 3306,
   postgres: 5432,
+  redshift: 5439,
   sqlserver: 1433,
 };
+
+/** MariaDB speaks the MySQL wire protocol and SQL dialect. */
+export function isMysqlFamily(engine: DbEngine): boolean {
+  return engine === 'mysql' || engine === 'mariadb';
+}
+
+/** Redshift is PostgreSQL wire-compatible (pg driver, "-quoting, $n params). */
+export function isPostgresFamily(engine: DbEngine): boolean {
+  return engine === 'postgres' || engine === 'redshift';
+}
 
 /**
  * Coerce arbitrary input (legacy null, "postgresql", casing) to a DbEngine.
@@ -30,6 +49,8 @@ export function normalizeEngine(value: string | null | undefined): DbEngine {
   if (v === 'sqlserver' || v === 'mssql' || v === 'sql_server' || v === 'sqlsrv') {
     return 'sqlserver';
   }
+  if (v === 'mariadb' || v === 'maria') return 'mariadb';
+  if (v === 'redshift') return 'redshift';
   return 'mysql';
 }
 
@@ -42,7 +63,7 @@ export function quoteIdent(engine: DbEngine, name: string): string {
   if (name.includes('\0')) {
     throw new Error('Identifier contains a NUL byte');
   }
-  if (engine === 'postgres') {
+  if (isPostgresFamily(engine)) {
     return `"${name.replace(/"/g, '""')}"`;
   }
   if (engine === 'sqlserver') {
@@ -57,8 +78,9 @@ export function quoteIdent(engine: DbEngine, name: string): string {
 /** The dialect string node-sql-parser expects for this engine. */
 export function parserDialect(
   engine: DbEngine,
-): 'MySQL' | 'PostgreSQL' | 'transactsql' {
+): 'MySQL' | 'PostgreSQL' | 'transactsql' | 'redshift' {
   if (engine === 'postgres') return 'PostgreSQL';
+  if (engine === 'redshift') return 'redshift';
   if (engine === 'sqlserver') return 'transactsql';
   return 'MySQL';
 }

@@ -849,6 +849,8 @@ export class ConversationsService {
     };
     if (engine === 'postgres')
       return this.executePaginatedPostgres(poolCfg, sql, page, pageSize, offset);
+    if (engine === 'redshift')
+      return this.executePaginatedRedshift(poolCfg, sql, page, pageSize, offset);
     if (engine === 'sqlserver')
       return this.executePaginatedSqlServer(poolCfg, sql, page, pageSize, offset);
     return this.executePaginatedMysql(poolCfg, sql, page, pageSize, offset);
@@ -1000,6 +1002,62 @@ export class ConversationsService {
           name: f.name,
           type: f.dataTypeID ?? 0,
         })),
+        rowCount: res.rows.length,
+        totalCount,
+        page,
+        pageSize,
+        totalPages: Math.ceil(totalCount / pageSize),
+        executionTimeMs: Date.now() - start,
+      };
+    } finally {
+      client.release();
+      await cleanup();
+    }
+  }
+
+  private async executePaginatedRedshift(
+    poolCfg: Parameters<typeof createPostgresPool>[0],
+    sql: string,
+    page: number,
+    pageSize: number,
+    offset: number,
+  ) {
+    // Redshift uses the pg driver but has no EXPLAIN (FORMAT JSON); we rely on
+    // statement_timeout + the COUNT/paging wrappers (which are standard SQL).
+    const { pool, cleanup } = await createPostgresPool(poolCfg);
+    const start = Date.now();
+    const client = await pool.connect();
+    try {
+      try {
+        await client.query('SET statement_timeout TO 30000');
+      } catch {
+        /* setting may be restricted; ignore */
+      }
+
+      const countSql = `SELECT COUNT(*) AS total FROM (${sql}) AS _count_query`;
+      let totalCount = 0;
+      try {
+        const countRes = await client.query(countSql);
+        totalCount = Number(countRes.rows[0]?.['total'] ?? 0);
+      } catch {
+        const res = await client.query(sql);
+        return {
+          rows: res.rows as Record<string, unknown>[],
+          fields: (res.fields ?? []).map((f) => ({ name: f.name, type: f.dataTypeID ?? 0 })),
+          rowCount: res.rows.length,
+          totalCount: res.rows.length,
+          page: 1,
+          pageSize: res.rows.length,
+          totalPages: 1,
+          executionTimeMs: Date.now() - start,
+        };
+      }
+
+      const paginatedSql = `${sql} LIMIT ${pageSize} OFFSET ${offset}`;
+      const res = await client.query(paginatedSql);
+      return {
+        rows: res.rows as Record<string, unknown>[],
+        fields: (res.fields ?? []).map((f) => ({ name: f.name, type: f.dataTypeID ?? 0 })),
         rowCount: res.rows.length,
         totalCount,
         page,

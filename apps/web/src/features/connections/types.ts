@@ -1,4 +1,9 @@
-export type DatabaseEngine = 'mysql' | 'postgres' | 'sqlserver';
+export type DatabaseEngine =
+  | 'mysql'
+  | 'mariadb'
+  | 'postgres'
+  | 'redshift'
+  | 'sqlserver';
 
 export interface Connection {
   id: string;

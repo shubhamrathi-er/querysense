@@ -1,4 +1,9 @@
-import { Injectable, NotFoundException, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  Logger,
+} from '@nestjs/common';
 import {
   createPool,
   type SqlClient,
@@ -86,6 +91,11 @@ export class SchemaAuditService {
     if (!connection) throw new NotFoundException('Connection not found');
 
     const engine = normalizeEngine(connection.engine);
+    if (engine === 'redshift') {
+      throw new BadRequestException(
+        'Schema audit is not yet supported for Amazon Redshift connections.',
+      );
+    }
     const dialect = auditDialect(engine);
     const tables = await this.introspect(connection, engine);
 

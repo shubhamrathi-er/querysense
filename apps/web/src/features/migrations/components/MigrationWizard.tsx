@@ -39,7 +39,10 @@ const SEV_COLOR: Record<Severity, string> = {
 export function MigrationWizard({ onClose }: Props) {
   const { data: connections } = useConnections();
   const { currentWorkspace } = useWorkspaceStore();
-  const active = (connections ?? []).filter((c) => c.status === 'ACTIVE');
+  // Redshift connections are excluded — data migration isn't supported for them yet.
+  const active = (connections ?? []).filter(
+    (c) => c.status === 'ACTIVE' && c.engine !== 'redshift',
+  );
 
   const [step, setStep] = useState<Step>('select');
   const [sourceId, setSourceId] = useState('');
@@ -234,6 +237,7 @@ export function MigrationWizard({ onClose }: Props) {
                 const name =
                   e === 'postgres' ? 'PostgreSQL'
                   : e === 'sqlserver' ? 'SQL Server'
+                  : e === 'mariadb' ? 'MariaDB'
                   : e === 'mysql' ? 'MySQL'
                   : null;
                 return name ? `${name} → ${name}` : 'Same-engine copy';

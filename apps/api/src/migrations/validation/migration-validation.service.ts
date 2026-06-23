@@ -1,4 +1,9 @@
-import { Injectable, NotFoundException, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  Logger,
+} from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { EncryptionService } from '../../common/encryption/encryption.service';
 import { MysqlAdapter } from './dialect/mysql.adapter';
@@ -501,6 +506,11 @@ export class MigrationValidationService {
       ssh: buildSshConfig(c, (s) => this.encryption.decrypt(s)),
     };
     const engine = normalizeEngine(c.engine);
+    if (engine === 'redshift') {
+      throw new BadRequestException(
+        'Migration validation is not yet supported for Amazon Redshift connections.',
+      );
+    }
     if (engine === 'postgres') return new PostgresAdapter(cfg);
     if (engine === 'sqlserver') return new SqlServerAdapter(cfg);
     return new MysqlAdapter(cfg);
