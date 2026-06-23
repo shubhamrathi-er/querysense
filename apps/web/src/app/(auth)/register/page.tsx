@@ -19,17 +19,17 @@ export default function RegisterPage() {
   return (
     <div className="relative min-h-screen w-full overflow-x-hidden lg:h-screen lg:overflow-hidden">
       <AnimatedGradient />
-
+ <div
+            className="pointer-events-none absolute h-80 w-80 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#5B4FF7]/15 blur-3xl transition-transform duration-300 ease-out"
+            style={{ left: glow.x, top: glow.y }}
+          />
       <div className="relative z-10 flex min-h-screen flex-col lg:h-screen lg:flex-row">
         {/* ── Left: product showcase ── */}
         <section
           onMouseMove={handleMove}
           className="relative hidden flex-col justify-between overflow-hidden px-10 py-8 lg:flex lg:h-screen lg:w-[60%] xl:px-14 xl:py-10"
         >
-          <div
-            className="pointer-events-none absolute h-80 w-80 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#5B4FF7]/15 blur-3xl transition-transform duration-300 ease-out"
-            style={{ left: glow.x, top: glow.y }}
-          />
+         
 
           <div className="relative">
             <HeroSection />
