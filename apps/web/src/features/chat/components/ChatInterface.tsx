@@ -230,6 +230,11 @@ export function ChatInterface({ conversationId }: Props) {
 
     try {
       await generate(content, connectionId);
+    } catch (err) {
+      // Surface generation failures (e.g. AI provider outage) as a toast rather
+      // than letting the rejection bubble up as an unhandled runtime error.
+      const msg = err instanceof Error ? err.message : 'Something went wrong. Please try again.';
+      toast.error(msg);
     } finally {
       setOptimisticMessages([]);
     }

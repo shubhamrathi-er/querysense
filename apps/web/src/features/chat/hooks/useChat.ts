@@ -133,6 +133,9 @@ export const useGenerateSQL = (conversationId: string) => {
         },
         (errorMsg) => {
           setIsPending(false);
+          // The user message is persisted server-side before generation, so
+          // refetch to keep it visible even though generation failed.
+          void queryClient.invalidateQueries({ queryKey: ['conversation', conversationId] });
           reject(new Error(errorMsg));
         },
       );
