@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  api-e2e:
+    name: API unit + e2e smoke
+    runs-on: ubuntu-latest
+
+    services:
+      # App metadata DB (Prisma datasource = mysql).
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: querysense
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      # Target database the e2e harness connects to.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: shop
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+
+    env:
+      NODE_ENV: test
+      PORT: '3001'
+      DATABASE_URL: mysql://root:root@127.0.0.1:3306/querysense
+      JWT_SECRET: ci-test-jwt-secret
+      JWT_REFRESH_SECRET: ci-test-refresh-secret
+      ENCRYPTION_KEY: ci-test-encryption-key-0123456789
+      # e2e harness config (AI keys intentionally omitted → AI steps skip).
+      E2E_API_URL: http://localhost:3001/api/v1
+      E2E_PG_HOST: 127.0.0.1
+      E2E_PG_PORT: '5432'
+      E2E_PG_DB: shop
+      E2E_PG_USER: postgres
+      E2E_PG_PASSWORD: postgres
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prisma generate + migrate
+        working-directory: apps/api
+        run: |
+          pnpm exec prisma generate
+          pnpm exec prisma migrate deploy
+
+      - name: Unit tests
+        run: pnpm --filter api test
+
+      - name: Build API
+        run: pnpm --filter api build
+
+      - name: Start API and wait for readiness
+        working-directory: apps/api
+        run: |
+          node dist/src/main.js > /tmp/api.log 2>&1 &
+          echo "started API (pid $!)"
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null http://localhost:3001/api/v1; then
+              echo "API is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "API failed to start"; cat /tmp/api.log; exit 1
+
+      - name: E2E smoke (deterministic core; AI steps skip without keys)
+        run: pnpm --filter api e2e:smoke
+
+      - name: API logs on failure
+        if: failure()
+        run: cat /tmp/api.log || true
