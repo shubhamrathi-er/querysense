@@ -132,3 +132,18 @@ describe('SqlValidatorService.parseClarification', () => {
     expect(res.clarify).toBe('Which did you mean?');
   });
 });
+
+describe('SqlValidatorService.isChatReply', () => {
+  const validator = new SqlValidatorService();
+
+  it('detects a CHAT: conversational reply and extracts the text', () => {
+    const r = validator.isChatReply('CHAT: You are right — Mexico is highest at 1299.');
+    expect(r.is).toBe(true);
+    expect(r.text).toBe('You are right — Mexico is highest at 1299.');
+  });
+
+  it('does not treat normal SQL or CANNOT_ANSWER output as chat', () => {
+    expect(validator.isChatReply('```sql\nSELECT 1\n```').is).toBe(false);
+    expect(validator.isChatReply('CANNOT_ANSWER: no such table').is).toBe(false);
+  });
+});

@@ -25,7 +25,7 @@ import {
 import type { ChatMessage } from './interfaces/ai-provider.interface';
 
 export interface SQLGenerationResult {
-  type: 'sql' | 'cannot_answer' | 'clarification';
+  type: 'sql' | 'cannot_answer' | 'clarification' | 'chat';
   sql: string | null;
   reason: string | null;
   /** Structured output (type === 'sql'). */
@@ -114,6 +114,19 @@ export class AiOrchestratorService {
             reason: null,
             clarify: clarification.clarify,
             interpretations: clarification.options,
+            tokensUsed: result.tokensUsed,
+            model: result.model,
+            latencyMs: result.latencyMs,
+          };
+        }
+
+        // Conversational reply (comment on prior results, correction, small talk).
+        const chat = this.validator.isChatReply(result.content);
+        if (chat.is) {
+          return {
+            type: 'chat',
+            sql: null,
+            reason: chat.text,
             tokensUsed: result.tokensUsed,
             model: result.model,
             latencyMs: result.latencyMs,

@@ -181,6 +181,13 @@ export class SqlValidatorService {
     return { tables: [], columns: [] };
   }
 
+  /** Detect a conversational (non-query) reply: `CHAT: ...`. */
+  isChatReply(aiResponse: string): { is: boolean; text: string } {
+    const match = aiResponse.trim().match(/^CHAT:\s*([\s\S]+)/i);
+    if (match) return { is: true, text: match[1].trim() };
+    return { is: false, text: '' };
+  }
+
   isCannotAnswer(aiResponse: string): { is: boolean; reason: string } {
     const match = aiResponse.trim().match(/^CANNOT_ANSWER:\s*(.+)/i);
     if (match) {

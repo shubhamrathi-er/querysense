@@ -9,6 +9,8 @@ export interface SQLPromptParams {
   engine: DbEngine;
   /** Past question→SQL pairs that ran successfully on this database. */
   fewShotExamples?: Array<{ question: string; sql: string }>;
+  /** The most recent executed query + its result rows, for follow-up replies. */
+  lastResult?: { sql: string; rows: Record<string, unknown>[] };
 }
 
 interface DialectGuidance {
@@ -96,6 +98,18 @@ function dialectGuidance(engine: DbEngine): DialectGuidance {
   };
 }
 
+/** Render the previous query + rows so the model can answer follow-up chat. */
+function lastResultBlock(
+  last?: { sql: string; rows: Record<string, unknown>[] },
+): string {
+  if (!last || last.rows.length === 0) return '';
+  return `
+## PREVIOUS RESULT (context for CHAT replies)
+SQL: ${last.sql}
+Rows (${last.rows.length}): ${JSON.stringify(last.rows.slice(0, 50))}
+`;
+}
+
 export function buildSQLGenerationPrompt(
   params: SQLPromptParams,
 ): ChatMessage[] {
@@ -131,6 +145,11 @@ No other commentary or preamble.
 If the question CANNOT be answered with the available schema, respond with exactly:
 CANNOT_ANSWER: <one sentence reason>
 
+## CONVERSATIONAL MESSAGES
+If the user's message is NOT a request for new data — it comments on, asks about, or draws a conclusion from the PREVIOUS RESULT below; corrects you; thanks you; or is small talk — do NOT write SQL. Instead reply with exactly one line:
+CHAT: <a short, helpful answer grounded in the previous result and conversation>
+Use the PREVIOUS RESULT rows to answer accurately (e.g. confirm which value is highest). Only use CHAT when the message clearly is not asking for new data; when in doubt, write SQL.
+${lastResultBlock(params.lastResult)}
 ## AMBIGUITY
 If the question has TWO OR MORE genuinely different reasonable interpretations that would each need DIFFERENT SQL (e.g. "top customers" could mean by order count or by total spend), do NOT guess. Respond with ONLY a JSON object inside a \`\`\`json code block:
 \`\`\`json

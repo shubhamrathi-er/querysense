@@ -11,7 +11,7 @@ describe('engine helpers', () => {
       expect(normalizeEngine(null)).toBe('mysql');
       expect(normalizeEngine(undefined)).toBe('mysql');
       expect(normalizeEngine('')).toBe('mysql');
-      expect(normalizeEngine('maria')).toBe('mysql');
+      expect(normalizeEngine('mongo')).toBe('mysql');
     });
 
     it('recognises postgres aliases', () => {

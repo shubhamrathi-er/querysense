@@ -253,6 +253,23 @@ export class ConversationsService {
         dto.content,
       );
 
+      // Most recent executed query + its rows, so the model can answer follow-up
+      // chat ("which is highest?", corrections) without re-running a query.
+      let lastResult: { sql: string; rows: Record<string, unknown>[] } | undefined;
+      const lastSqlMsg = history.find(
+        (m) => m.role === 'ASSISTANT' && m.generatedSql,
+      );
+      if (lastSqlMsg?.generatedSql) {
+        const qh = await this.prisma.queryHistory.findUnique({
+          where: { messageId: lastSqlMsg.id },
+          select: { resultSnapshot: true },
+        });
+        const rows = Array.isArray(qh?.resultSnapshot)
+          ? (qh.resultSnapshot as Record<string, unknown>[])
+          : [];
+        if (rows.length) lastResult = { sql: lastSqlMsg.generatedSql, rows };
+      }
+
       this.logger.log(`Generating SQL for: "${dto.content}"`);
       const sqlResult = await this.ai.generateSQL({
         userQuestion: dto.content,
@@ -261,6 +278,7 @@ export class ConversationsService {
         databaseName: connection.databaseName,
         engine: normalizeEngine(connection.engine),
         fewShotExamples,
+        lastResult,
       });
 
       // Handle CANNOT_ANSWER
@@ -284,6 +302,32 @@ export class ConversationsService {
 
         await this.updateTitleIfNeeded(conversationId, dto.content);
         send('done', { type: 'cannot_answer', message });
+        res.end();
+        return;
+      }
+
+      // Conversational reply — a comment/correction/follow-up about prior
+      // results, answered directly without generating or running a new query.
+      if (sqlResult.type === 'chat') {
+        send('step', {
+          step: 'generating',
+          label: 'Generating SQL query',
+          status: 'done',
+        });
+
+        const message = await this.prisma.message.create({
+          data: {
+            conversationId,
+            role: 'ASSISTANT',
+            content: sqlResult.reason ?? '',
+            modelUsed: sqlResult.model,
+            tokensUsed: sqlResult.tokensUsed,
+            latencyMs: sqlResult.latencyMs,
+          },
+        });
+
+        await this.updateTitleIfNeeded(conversationId, dto.content);
+        send('done', { type: 'chat', message });
         res.end();
         return;
       }
