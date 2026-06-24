@@ -433,9 +433,15 @@ export class ConversationsService {
 
       res.end();
     } catch (error) {
+      const raw = error instanceof Error ? error.message : '';
+      this.logger.error(`SQL generation failed: ${raw || error}`);
+      // Don't leak internal/config detail (e.g. "add an API key in your .env")
+      // to end users — map AI-provider outages to a friendly, retryable message.
+      const aiDown = /AI providers? (failed|are not configured)|not configured/i.test(raw);
       send('error', {
-        message:
-          error instanceof Error ? error.message : 'Something went wrong',
+        message: aiDown
+          ? 'The AI service is temporarily unavailable. Please try again in a moment.'
+          : raw || 'Something went wrong',
       });
       res.end();
     }

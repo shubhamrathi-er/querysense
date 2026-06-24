@@ -49,7 +49,10 @@ const skip = (name: string, why: string) => {
   console.log(`  ⏭️  ${name} — ${why}`);
 };
 const noAiQuota = (err: string | null) =>
-  !!err && /providers? (failed|are not configured)|rate|configured|quota/i.test(err);
+  !!err &&
+  /providers? (failed|are not configured)|rate|configured|quota|AI service|temporarily unavailable/i.test(
+    err,
+  );
 
 function unwrap(parsed: any) {
   if (parsed && typeof parsed === 'object' && 'success' in parsed && 'data' in parsed)
