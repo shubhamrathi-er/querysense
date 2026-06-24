@@ -36,8 +36,8 @@ jobs:
       NODE_ENV: test
       PORT: '3001'
       DATABASE_URL: mysql://root:root@127.0.0.1:3306/querysense
-      JWT_SECRET: ci-test-jwt-secret
-      JWT_REFRESH_SECRET: ci-test-refresh-secret
+      JWT_SECRET: ci-test-jwt-secret-0123456789-0123456789
+      JWT_REFRESH_SECRET: ci-test-refresh-secret-0123456789-0123456789
       ENCRYPTION_KEY: ci-test-encryption-key-0123456789
       # e2e harness config (AI keys intentionally omitted → AI steps skip).
       E2E_API_URL: http://localhost:3001/api/v1
