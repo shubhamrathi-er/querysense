@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useConversation, useGenerateSQL, useRecordImport } from '../hooks/useChat';
 import { useConnections } from '@/features/connections/hooks/useConnections';
+import { engineLabel } from '@/features/connections/types';
 import { useWorkspaceStore } from '@/stores/workspace.store';
 import { useChatStore } from '@/stores/chat.store';
 import { MessageList } from './MessageList';
@@ -273,7 +274,7 @@ export function ChatInterface({ conversationId }: Props) {
           <span className="text-sm font-medium text-foreground">
             {selectedConnection?.name ?? 'Connected'}
           </span>
-          <span className="text-xs text-muted-foreground">· MySQL</span>
+          <span className="text-xs text-muted-foreground">· {engineLabel(selectedConnection?.engine)}</span>
         </div>
         <ConnectionSelector
           selectedId={connectionId}

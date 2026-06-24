@@ -7,6 +7,21 @@ export type DatabaseEngine =
   | 'snowflake'
   | 'oracle';
 
+/** Human-facing label for a database engine. */
+export const ENGINE_LABELS: Record<DatabaseEngine, string> = {
+  mysql: 'MySQL',
+  mariadb: 'MariaDB',
+  postgres: 'PostgreSQL',
+  redshift: 'Redshift',
+  sqlserver: 'SQL Server',
+  snowflake: 'Snowflake',
+  oracle: 'Oracle',
+};
+
+export function engineLabel(engine: DatabaseEngine | null | undefined): string {
+  return engine ? (ENGINE_LABELS[engine] ?? 'MySQL') : 'MySQL';
+}
+
 export interface Connection {
   id: string;
   name: string;
