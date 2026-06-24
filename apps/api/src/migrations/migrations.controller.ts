@@ -7,7 +7,7 @@ import {
   Res,
 } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
-import express from 'express';
+import type express from 'express';
 import { DataMigrationService } from './data-migration.service';
 import { MigrationValidationService } from './validation/migration-validation.service';
 import {
