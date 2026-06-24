@@ -178,7 +178,7 @@ export default function DashboardPage() {
               </div>
             ) : conns.length > 0 ? (
               // ~2 connections visible; the rest scroll.
-              <div className="max-h-[296px] space-y-2.5 overflow-y-auto pr-1 [scrollbar-width:thin]">
+              <div className="max-h-[265px] space-y-2.5 overflow-y-auto pr-1 [scrollbar-width:thin]">
                 {conns.map((c, i) => (
                   <DashboardConnectionCard key={c.id} connection={c} index={i} />
                 ))}
