@@ -4,6 +4,7 @@ import * as mssql from 'mssql';
 import * as snowflake from 'snowflake-sdk';
 import * as oracledb from 'oracledb';
 import * as net from 'net';
+import { createHash } from 'crypto';
 import { Client } from 'ssh2';
 import { DbEngine } from './engine';
 
@@ -127,43 +128,154 @@ async function openSshTunnel(
   return { host: '127.0.0.1', port, close };
 }
 
-/**
- * Create a mysql2 pool, transparently tunnelling through SSH when configured.
- * Always pair with the returned cleanup() (ends the pool and the tunnel).
- */
-export async function createMysqlPool(cfg: PoolConfig): Promise<TunneledPool> {
-  let tunnel: { host: string; port: number; close: () => Promise<void> } | null =
-    null;
-  let host = cfg.host;
-  let port = cfg.port;
+// ── Pool cache ───────────────────────────────────────────────────────────────
+// Creating a fresh pool (and SSH tunnel) per query is wasteful on the hot read
+// path. We cache pools by connection identity and keep them warm, evicting after
+// an idle period. `cleanup()` becomes a RELEASE (ref-count decrement), not a
+// close — the pool is only torn down once it's been idle with no in-flight use.
+const POOL_IDLE_TTL_MS = 60_000;
 
-  if (cfg.ssh) {
-    tunnel = await openSshTunnel(cfg.ssh, cfg.host, cfg.port);
-    host = tunnel.host;
-    port = tunnel.port;
+interface CachedPool {
+  pool: unknown;
+  closeUnderlying: () => Promise<void>;
+  inFlight: number;
+  idleTimer: NodeJS.Timeout | null;
+}
+const POOL_CACHE = new Map<string, Promise<CachedPool>>();
+
+function poolKey(prefix: string, cfg: PoolConfig): string {
+  const ssh = cfg.ssh
+    ? `${cfg.ssh.host}:${cfg.ssh.port}:${cfg.ssh.username}`
+    : '';
+  // Hash secrets into the key so a credential change yields a fresh pool
+  // (rather than silently reusing one authenticated with the old password).
+  const secret = createHash('sha256')
+    .update(
+      [cfg.password, cfg.ssh?.password, cfg.ssh?.privateKey, cfg.ssh?.passphrase]
+        .map((s) => s ?? '')
+        .join('\0'),
+    )
+    .digest('hex')
+    .slice(0, 16);
+  return [
+    prefix, cfg.host, cfg.port, cfg.database, cfg.user,
+    cfg.ssl ? 1 : 0, cfg.connectionLimit ?? '', ssh, secret,
+  ].join('|');
+}
+
+/**
+ * Acquire a cached pool (creating it on first use), returning the pool plus a
+ * release-style cleanup(). The pool is shared across concurrent callers and
+ * reused across requests; it is closed only after POOL_IDLE_TTL_MS with zero
+ * in-flight holders.
+ */
+async function acquireCachedPool<T>(
+  prefix: string,
+  cfg: PoolConfig,
+  factory: () => Promise<{
+    pool: T;
+    tunnel: { close: () => Promise<void> } | null;
+  }>,
+): Promise<{ pool: T; cleanup: () => Promise<void> }> {
+  const key = poolKey(prefix, cfg);
+  let entryPromise = POOL_CACHE.get(key);
+  if (!entryPromise) {
+    entryPromise = (async (): Promise<CachedPool> => {
+      const { pool, tunnel } = await factory();
+      return {
+        pool,
+        inFlight: 0,
+        idleTimer: null,
+        closeUnderlying: async () => {
+          try {
+            await (pool as { end?: () => Promise<void> }).end?.();
+          } catch {
+            /* ignore */
+          }
+          if (tunnel) await tunnel.close();
+        },
+      };
+    })();
+    POOL_CACHE.set(key, entryPromise);
+    // If creation fails, drop the rejected entry so the next call retries.
+    entryPromise.catch(() => {
+      if (POOL_CACHE.get(key) === entryPromise) POOL_CACHE.delete(key);
+    });
   }
 
-  const pool = mysql.createPool({
-    host,
-    port,
-    database: cfg.database,
-    user: cfg.user,
-    password: cfg.password,
-    ssl: cfg.ssl ? { rejectUnauthorized: false } : undefined,
-    connectionLimit: cfg.connectionLimit ?? 3,
-    connectTimeout: cfg.connectTimeout ?? 10000,
-  });
+  const entry = await entryPromise;
+  entry.inFlight += 1;
+  if (entry.idleTimer) {
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = null;
+  }
 
+  let released = false;
   const cleanup = async () => {
-    try {
-      await pool.end();
-    } catch {
-      /* ignore */
+    if (released) return;
+    released = true;
+    entry.inFlight = Math.max(0, entry.inFlight - 1);
+    if (entry.inFlight === 0) {
+      entry.idleTimer = setTimeout(() => {
+        if (entry.inFlight > 0) return;
+        if (POOL_CACHE.get(key) === entryPromise) POOL_CACHE.delete(key);
+        void entry.closeUnderlying();
+      }, POOL_IDLE_TTL_MS);
+      // Don't let the eviction timer keep the process alive.
+      entry.idleTimer.unref?.();
     }
-    if (tunnel) await tunnel.close();
   };
 
-  return { pool, cleanup };
+  return { pool: entry.pool as T, cleanup };
+}
+
+/** Close and drop every cached pool (e.g. on graceful shutdown). */
+export async function closeAllPools(): Promise<void> {
+  const entries = [...POOL_CACHE.values()];
+  POOL_CACHE.clear();
+  await Promise.all(
+    entries.map(async (p) => {
+      try {
+        const e = await p;
+        if (e.idleTimer) clearTimeout(e.idleTimer);
+        await e.closeUnderlying();
+      } catch {
+        /* ignore */
+      }
+    }),
+  );
+}
+
+/**
+ * Create (or reuse a cached) mysql2 pool, transparently tunnelling through SSH
+ * when configured. The returned cleanup() releases the pool back to the cache.
+ */
+export async function createMysqlPool(cfg: PoolConfig): Promise<TunneledPool> {
+  return acquireCachedPool<mysql.Pool>('mysql', cfg, async () => {
+    let tunnel: { host: string; port: number; close: () => Promise<void> } | null =
+      null;
+    let host = cfg.host;
+    let port = cfg.port;
+
+    if (cfg.ssh) {
+      tunnel = await openSshTunnel(cfg.ssh, cfg.host, cfg.port);
+      host = tunnel.host;
+      port = tunnel.port;
+    }
+
+    const pool = mysql.createPool({
+      host,
+      port,
+      database: cfg.database,
+      user: cfg.user,
+      password: cfg.password,
+      ssl: cfg.ssl ? { rejectUnauthorized: false } : undefined,
+      connectionLimit: cfg.connectionLimit ?? 3,
+      connectTimeout: cfg.connectTimeout ?? 10000,
+    });
+
+    return { pool, tunnel };
+  });
 }
 
 export interface TunneledPgPool {
@@ -178,43 +290,36 @@ export interface TunneledPgPool {
 export async function createPostgresPool(
   cfg: PoolConfig,
 ): Promise<TunneledPgPool> {
-  let tunnel: { host: string; port: number; close: () => Promise<void> } | null =
-    null;
-  let host = cfg.host;
-  let port = cfg.port;
+  return acquireCachedPool<PgPool>('postgres', cfg, async () => {
+    let tunnel: { host: string; port: number; close: () => Promise<void> } | null =
+      null;
+    let host = cfg.host;
+    let port = cfg.port;
 
-  if (cfg.ssh) {
-    tunnel = await openSshTunnel(cfg.ssh, cfg.host, cfg.port);
-    host = tunnel.host;
-    port = tunnel.port;
-  }
-
-  const pool = new PgPool({
-    host,
-    port,
-    database: cfg.database,
-    user: cfg.user,
-    password: cfg.password,
-    ssl: cfg.ssl ? { rejectUnauthorized: false } : undefined,
-    max: cfg.connectionLimit ?? 3,
-    connectionTimeoutMillis: cfg.connectTimeout ?? 10000,
-  });
-  // A pool-level error handler is mandatory for pg; without it an idle-client
-  // error (e.g. server restart) crashes the process.
-  pool.on('error', () => {
-    /* swallow; the failing client is removed from the pool automatically */
-  });
-
-  const cleanup = async () => {
-    try {
-      await pool.end();
-    } catch {
-      /* ignore */
+    if (cfg.ssh) {
+      tunnel = await openSshTunnel(cfg.ssh, cfg.host, cfg.port);
+      host = tunnel.host;
+      port = tunnel.port;
     }
-    if (tunnel) await tunnel.close();
-  };
 
-  return { pool, cleanup };
+    const pool = new PgPool({
+      host,
+      port,
+      database: cfg.database,
+      user: cfg.user,
+      password: cfg.password,
+      ssl: cfg.ssl ? { rejectUnauthorized: false } : undefined,
+      max: cfg.connectionLimit ?? 3,
+      connectionTimeoutMillis: cfg.connectTimeout ?? 10000,
+    });
+    // A pool-level error handler is mandatory for pg; without it an idle-client
+    // error (e.g. server restart) crashes the process.
+    pool.on('error', () => {
+      /* swallow; the failing client is removed from the pool automatically */
+    });
+
+    return { pool, tunnel };
+  });
 }
 
 export interface TunneledMssqlPool {
