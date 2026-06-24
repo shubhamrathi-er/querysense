@@ -880,13 +880,57 @@ export class ConversationsService {
   }
 
   /**
-   * Normalise a generated query so it can be safely wrapped as a subquery for
-   * COUNT and pagination: strip trailing semicolons/whitespace. Without this,
-   * `SELECT COUNT(*) FROM (<sql>;)` is a syntax error and pagination silently
-   * falls back to a single page.
+   * Normalise a generated query so it can be safely wrapped/extended for COUNT
+   * and pagination: strip trailing semicolons/whitespace. Without this,
+   * `SELECT COUNT(*) FROM (<sql>;)` is a syntax error.
    */
   private unwrapInner(sql: string): string {
     return sql.trim().replace(/;+\s*$/, '');
+  }
+
+  /**
+   * Split a query's own trailing row-limit clause from its body so pagination
+   * can be re-applied at the TOP level (a derived-table wrap would discard the
+   * query's ORDER BY — SQL only guarantees ordering at the outermost level).
+   * Returns the body and the row cap the query asked for (null if none), so the
+   * cap is honoured (e.g. an intentional "top 10" stays 10 rows).
+   *  - 'limit'  : MySQL/Postgres/Redshift/Snowflake `LIMIT n [OFFSET m]` / `LIMIT m, n`
+   *  - 'fetch'  : Oracle `[OFFSET m ROWS] FETCH FIRST|NEXT n ROWS ONLY`
+   *  - 'top'    : SQL Server `SELECT TOP n ...`
+   */
+  private splitLimit(
+    sql: string,
+    style: 'limit' | 'fetch' | 'top',
+  ): { base: string; limit: number | null } {
+    if (style === 'limit') {
+      const m = sql.match(
+        /\s+limit\s+(\d+)\s*(?:,\s*(\d+)|offset\s+\d+)?\s*$/i,
+      );
+      if (!m) return { base: sql, limit: null };
+      const limit = m[2] != null ? Number(m[2]) : Number(m[1]);
+      return { base: sql.slice(0, m.index).trimEnd(), limit };
+    }
+    if (style === 'fetch') {
+      const m = sql.match(
+        /\s+(?:offset\s+\d+\s+rows\s+)?fetch\s+(?:first|next)\s+(\d+)\s+rows\s+only\s*$/i,
+      );
+      if (!m) return { base: sql, limit: null };
+      return { base: sql.slice(0, m.index).trimEnd(), limit: Number(m[1]) };
+    }
+    // top
+    const m = sql.match(/^(\s*select\s+)top\s*\(?\s*(\d+)\s*\)?\s+/i);
+    if (!m) return { base: sql, limit: null };
+    return { base: sql.replace(m[0], m[1]), limit: Number(m[2]) };
+  }
+
+  /** Effective LIMIT for a page, never serving beyond the query's own cap. */
+  private effLimit(limit: number | null, pageSize: number, offset: number): number {
+    return limit != null ? Math.max(0, Math.min(pageSize, limit - offset)) : pageSize;
+  }
+
+  /** totalCount capped at the query's own row limit, for honest paging math. */
+  private cappedTotal(realCount: number, limit: number | null): number {
+    return limit != null ? Math.min(realCount, limit) : realCount;
   }
 
   private async executePaginated(
@@ -939,6 +983,7 @@ export class ConversationsService {
     const { pool, cleanup } = await createMysqlPool(poolCfg);
     const start = Date.now();
     const inner = this.unwrapInner(sql);
+    const { base, limit } = this.splitLimit(inner, 'limit');
 
     try {
       await pool.query('SET SESSION MAX_EXECUTION_TIME = 30000');
@@ -946,7 +991,7 @@ export class ConversationsService {
       // Guardrail — estimate scan size via EXPLAIN before touching real rows.
       try {
         const [explainRows] = await pool.query<mysql.RowDataPacket[]>(
-          `EXPLAIN ${inner}`,
+          `EXPLAIN ${base}`,
         );
         const verdict = this.guard.evaluateExplain(
           explainRows as Record<string, unknown>[],
@@ -962,14 +1007,15 @@ export class ConversationsService {
         // the real error (which may then trigger the repair loop).
       }
 
-      const countSql = `SELECT COUNT(*) as total FROM (${inner}) as _count_query`;
+      const countSql = `SELECT COUNT(*) as total FROM (${base}) as _count_query`;
       let totalCount = 0;
 
       try {
         const [countRows] = await pool.query<mysql.RowDataPacket[]>(countSql);
-        totalCount = Number(
+        const realCount = Number(
           (countRows[0] as Record<string, unknown>)?.['total'] ?? 0,
         );
+        totalCount = this.cappedTotal(realCount, limit);
       } catch {
         const [rows, fields] = await pool.query<mysql.RowDataPacket[]>(inner);
         const resultRows = Array.isArray(rows) ? rows : [];
@@ -988,7 +1034,7 @@ export class ConversationsService {
         };
       }
 
-      const paginatedSql = `SELECT * FROM (${inner}) as _page LIMIT ${pageSize} OFFSET ${offset}`;
+      const paginatedSql = `${base} LIMIT ${this.effLimit(limit, pageSize, offset)} OFFSET ${offset}`;
       const [rows, fields] =
         await pool.query<mysql.RowDataPacket[]>(paginatedSql);
       const resultRows = Array.isArray(rows) ? rows : [];
@@ -1020,7 +1066,7 @@ export class ConversationsService {
   ) {
     const { pool, cleanup } = await createPostgresPool(poolCfg);
     const start = Date.now();
-    const inner = this.unwrapInner(sql);
+    const { base, limit } = this.splitLimit(this.unwrapInner(sql), 'limit');
     // Use one dedicated client so statement_timeout applies to every query.
     const client = await pool.connect();
 
@@ -1029,7 +1075,7 @@ export class ConversationsService {
 
       // Guardrail — estimate scan size via EXPLAIN (JSON plan) before real rows.
       try {
-        const plan = await client.query(`EXPLAIN (FORMAT JSON) ${inner}`);
+        const plan = await client.query(`EXPLAIN (FORMAT JSON) ${base}`);
         const root = (plan.rows[0]?.['QUERY PLAN'] as
           | Array<{ Plan?: { ['Plan Rows']?: number } }>
           | undefined)?.[0];
@@ -1045,14 +1091,14 @@ export class ConversationsService {
         // EXPLAIN itself failed — let normal execution surface the real error.
       }
 
-      const countSql = `SELECT COUNT(*) AS total FROM (${inner}) AS _count_query`;
+      const countSql = `SELECT COUNT(*) AS total FROM (${base}) AS _count_query`;
       let totalCount = 0;
 
       try {
         const countRes = await client.query(countSql);
-        totalCount = Number(countRes.rows[0]?.['total'] ?? 0);
+        totalCount = this.cappedTotal(Number(countRes.rows[0]?.['total'] ?? 0), limit);
       } catch {
-        const res = await client.query(inner);
+        const res = await client.query(this.unwrapInner(sql));
         return {
           rows: res.rows as Record<string, unknown>[],
           fields: (res.fields ?? []).map((f) => ({
@@ -1068,7 +1114,7 @@ export class ConversationsService {
         };
       }
 
-      const paginatedSql = `SELECT * FROM (${inner}) AS _page LIMIT ${pageSize} OFFSET ${offset}`;
+      const paginatedSql = `${base} LIMIT ${this.effLimit(limit, pageSize, offset)} OFFSET ${offset}`;
       const res = await client.query(paginatedSql);
 
       return {
@@ -1101,7 +1147,7 @@ export class ConversationsService {
     // statement_timeout + the COUNT/paging wrappers (which are standard SQL).
     const { pool, cleanup } = await createPostgresPool(poolCfg);
     const start = Date.now();
-    const inner = this.unwrapInner(sql);
+    const { base, limit } = this.splitLimit(this.unwrapInner(sql), 'limit');
     const client = await pool.connect();
     try {
       try {
@@ -1110,13 +1156,13 @@ export class ConversationsService {
         /* setting may be restricted; ignore */
       }
 
-      const countSql = `SELECT COUNT(*) AS total FROM (${inner}) AS _count_query`;
+      const countSql = `SELECT COUNT(*) AS total FROM (${base}) AS _count_query`;
       let totalCount = 0;
       try {
         const countRes = await client.query(countSql);
-        totalCount = Number(countRes.rows[0]?.['total'] ?? 0);
+        totalCount = this.cappedTotal(Number(countRes.rows[0]?.['total'] ?? 0), limit);
       } catch {
-        const res = await client.query(inner);
+        const res = await client.query(this.unwrapInner(sql));
         return {
           rows: res.rows as Record<string, unknown>[],
           fields: (res.fields ?? []).map((f) => ({ name: f.name, type: f.dataTypeID ?? 0 })),
@@ -1129,7 +1175,7 @@ export class ConversationsService {
         };
       }
 
-      const paginatedSql = `SELECT * FROM (${inner}) AS _page LIMIT ${pageSize} OFFSET ${offset}`;
+      const paginatedSql = `${base} LIMIT ${this.effLimit(limit, pageSize, offset)} OFFSET ${offset}`;
       const res = await client.query(paginatedSql);
       return {
         rows: res.rows as Record<string, unknown>[],
@@ -1157,17 +1203,21 @@ export class ConversationsService {
     const { pool, cleanup } = await createSqlServerPool(poolCfg);
     const start = Date.now();
     const inner = this.unwrapInner(sql);
+    // SQL Server caps rows with `TOP n`; strip it so we can page at the top level.
+    const { base, limit } = this.splitLimit(inner, 'top');
+    // COUNT subquery can't carry a bare ORDER BY in T-SQL, so drop the trailing one.
+    const countBase = base.replace(/\s+order\s+by\b[\s\S]*$/i, '');
     const fieldsOf = (rs: { columns: Record<string, { name: string }> } | undefined) =>
       Object.values(rs?.columns ?? {}).map((f) => ({ name: f.name, type: 0 }));
 
     try {
       // SQL Server has no cheap row-estimate EXPLAIN; rely on requestTimeout +
       // paging to bound cost (the COUNT below also fails fast on bad SQL).
-      const countSql = `SELECT COUNT_BIG(*) AS total FROM (${inner}) AS _count_query`;
+      const countSql = `SELECT COUNT_BIG(*) AS total FROM (${countBase}) AS _count_query`;
       let totalCount = 0;
       try {
         const c = await pool.request().query(countSql);
-        totalCount = Number(c.recordset[0]?.['total'] ?? 0);
+        totalCount = this.cappedTotal(Number(c.recordset[0]?.['total'] ?? 0), limit);
       } catch {
         const res = await pool.request().query(inner);
         const rows = (res.recordset ?? []) as Record<string, unknown>[];
@@ -1183,9 +1233,11 @@ export class ConversationsService {
         };
       }
 
-      // Wrap as a derived table; OFFSET/FETCH needs an ORDER BY, so supply a no-op
-      // one at the outer level (the inner query keeps its own ordering).
-      const paged = `SELECT * FROM (${inner}) AS _page ORDER BY (SELECT NULL) OFFSET ${offset} ROWS FETCH NEXT ${pageSize} ROWS ONLY`;
+      // OFFSET/FETCH paging at the top level keeps the query's own ORDER BY;
+      // supply a no-op ORDER BY only if it has none.
+      const hasOrderBy = /\border\s+by\b/i.test(base);
+      const eff = this.effLimit(limit, pageSize, offset);
+      const paged = `${base} ${hasOrderBy ? '' : 'ORDER BY (SELECT NULL)'} OFFSET ${offset} ROWS FETCH NEXT ${eff} ROWS ONLY`;
       const res = await pool.request().query(paged);
       const rows = (res.recordset ?? []) as Record<string, unknown>[];
 
@@ -1214,15 +1266,16 @@ export class ConversationsService {
     const sf = await createSnowflakePool(poolCfg);
     const start = Date.now();
     const inner = this.unwrapInner(sql);
+    const { base, limit } = this.splitLimit(inner, 'limit');
     const fieldsOf = (rows: Record<string, unknown>[]) =>
       rows[0] ? Object.keys(rows[0]).map((name) => ({ name, type: 0 })) : [];
     try {
       let totalCount = 0;
       try {
         const c = await sf.execute<{ total: number }>(
-          `SELECT COUNT(*) AS "total" FROM (${inner}) AS _count_query`,
+          `SELECT COUNT(*) AS "total" FROM (${base}) AS _count_query`,
         );
-        totalCount = Number(c[0]?.total ?? 0);
+        totalCount = this.cappedTotal(Number(c[0]?.total ?? 0), limit);
       } catch {
         const rows = await sf.execute<Record<string, unknown>>(inner);
         return {
@@ -1237,7 +1290,7 @@ export class ConversationsService {
         };
       }
       const rows = await sf.execute<Record<string, unknown>>(
-        `SELECT * FROM (${inner}) AS _page LIMIT ${pageSize} OFFSET ${offset}`,
+        `${base} LIMIT ${this.effLimit(limit, pageSize, offset)} OFFSET ${offset}`,
       );
       return {
         rows,
@@ -1264,6 +1317,7 @@ export class ConversationsService {
     const { pool, cleanup } = await createOraclePool(poolCfg);
     const start = Date.now();
     const inner = this.unwrapInner(sql);
+    const { base, limit } = this.splitLimit(inner, 'fetch');
     const oracledb = await import('oracledb');
     const fieldsOf = (rows: Record<string, unknown>[]) =>
       rows[0] ? Object.keys(rows[0]).map((name) => ({ name, type: 0 })) : [];
@@ -1286,8 +1340,8 @@ export class ConversationsService {
     try {
       let totalCount = 0;
       try {
-        const c = await run(`SELECT COUNT(*) AS "total" FROM (${inner})`);
-        totalCount = Number(c[0]?.['total'] ?? 0);
+        const c = await run(`SELECT COUNT(*) AS "total" FROM (${base})`);
+        totalCount = this.cappedTotal(Number(c[0]?.['total'] ?? 0), limit);
       } catch {
         const rows = await run(inner);
         return {
@@ -1302,7 +1356,7 @@ export class ConversationsService {
         };
       }
       const rows = await run(
-        `SELECT * FROM (${inner}) OFFSET ${offset} ROWS FETCH NEXT ${pageSize} ROWS ONLY`,
+        `${base} OFFSET ${offset} ROWS FETCH NEXT ${this.effLimit(limit, pageSize, offset)} ROWS ONLY`,
       );
       return {
         rows,
