@@ -306,21 +306,32 @@ Return the corrected SQL.`;
   ];
 }
 
+/**
+ * Defensive ceiling on rows sent to the insight model. `results` is already the
+ * returned result page (pagination caps it at MAX_PAGE_SIZE = 200), so in normal
+ * operation the model sees EVERY returned row — this only guards against a caller
+ * ever passing an unbounded array, keeping superlative claims grounded.
+ */
+const INSIGHT_ROW_CAP = 500;
+
 export function buildInsightPrompt(
   question: string,
   sql: string,
   results: Record<string, unknown>[],
 ): ChatMessage[] {
-  const sampleRows = results.slice(0, 5);
   const totalRows = results.length;
+  const sampleRows = results.slice(0, INSIGHT_ROW_CAP);
+  const truncated = totalRows > sampleRows.length;
 
   return [
     {
       role: 'system',
-      content: `You are a data analyst. Given a question, the SQL that was run, and the results, 
-provide a concise 2-3 sentence business insight. 
+      content: `You are a data analyst. Given a question, the SQL that was run, and the results,
+provide a concise 2-3 sentence business insight.
 Focus on what the data means, not on the SQL itself.
-Be specific about numbers. Use plain English.`,
+Be specific about numbers. Use plain English.
+Base every claim ONLY on the rows provided below — do not guess values you cannot see.
+${'If the rows are truncated, do not state which value is the overall highest/lowest.'}`,
     },
     {
       role: 'user',
@@ -331,7 +342,7 @@ SQL executed:
 ${sql}
 \`\`\`
 
-Results (${totalRows} rows total, showing first 5):
+Results (${totalRows} rows total${truncated ? `, showing the first ${sampleRows.length}` : ''}):
 ${JSON.stringify(sampleRows, null, 2)}
 
 Provide a concise business insight about these results.`,

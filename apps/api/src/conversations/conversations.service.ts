@@ -525,8 +525,12 @@ export class ConversationsService {
     let insightText = '';
     try {
       if (queryResult.rows.length > 0) {
+        const question = await this.getQuestionForMessage(
+          conversationId,
+          messageId,
+        );
         const insight = await this.ai.generateInsight(
-          effectiveSql,
+          question ?? effectiveSql,
           effectiveSql,
           queryResult.rows,
         );
