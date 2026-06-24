@@ -225,15 +225,24 @@ export class ConversationsService {
         take: 6,
       });
 
-      const conversationHistory = history
+      // Compact, deterministic recap of prior turns (drops "SQL generated…"
+      // filler) — gives the model carry-over intent + the last SQL to modify,
+      // without dumping full raw turns. `history` is newest-first; reverse to
+      // chronological and drop the current (last) user message.
+      const conversationContext = history
+        .slice()
         .reverse()
         .slice(0, -1)
-        .map((m) => ({
-          role: m.role.toLowerCase() as 'user' | 'assistant',
-          content: m.generatedSql
-            ? `${m.content}\n\nSQL: ${m.generatedSql}`
-            : m.content,
-        }));
+        .map((m) => {
+          if (m.role === 'USER') return `User: ${m.content}`;
+          if (m.generatedSql) {
+            return `Assistant SQL: ${m.generatedSql.replace(/\s+/g, ' ').trim()}`;
+          }
+          return m.content ? `Assistant: ${m.content}` : '';
+        })
+        .filter(Boolean)
+        .slice(-8)
+        .join('\n');
 
       // Step 4 — Generate SQL
       send('step', {
@@ -274,7 +283,7 @@ export class ConversationsService {
       const sqlResult = await this.ai.generateSQL({
         userQuestion: dto.content,
         schemaContext,
-        conversationHistory,
+        conversationContext,
         databaseName: connection.databaseName,
         engine: normalizeEngine(connection.engine),
         fewShotExamples,

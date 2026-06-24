@@ -4,7 +4,9 @@ import type { DbEngine } from '../../common/db/engine';
 export interface SQLPromptParams {
   userQuestion: string;
   schemaContext: string;
-  conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }>;
+  /** Compact, deterministic recap of recent turns (Q → SQL / reply), built by
+   *  the caller — replaces dumping raw conversation turns into the prompt. */
+  conversationContext?: string;
   databaseName: string;
   engine: DbEngine;
   /** Past question→SQL pairs that ran successfully on this database. */
@@ -124,7 +126,7 @@ Convert natural language questions into precise, optimized ${d.name} queries.
 
 ## DATABASE SCHEMA
 ${params.schemaContext}
-
+${params.conversationContext ? `\n## CONVERSATION SO FAR\nUse this only to resolve follow-ups like "now by month" or "modify that"; the latest user message below is the request to answer.\n${params.conversationContext}\n` : ''}
 ## STRICT RULES
 1. ONLY use tables and columns that exist in the schema above
 2. ALWAYS use table aliases for clarity (e.g. SELECT u.name FROM users u)
@@ -170,12 +172,6 @@ Give 2-3 options, each with valid SQL following all rules above. Only do this wh
   for (const ex of params.fewShotExamples ?? []) {
     messages.push({ role: 'user', content: ex.question });
     messages.push({ role: 'assistant', content: '```sql\n' + ex.sql + '\n```' });
-  }
-
-  // Add last 4 conversation turns for context
-  const recentHistory = params.conversationHistory.slice(-4);
-  for (const turn of recentHistory) {
-    messages.push({ role: turn.role, content: turn.content });
   }
 
   messages.push({ role: 'user', content: params.userQuestion });

@@ -113,7 +113,6 @@ async function main() {
   const gen2 = await safeGenerate({
     userQuestion: q2,
     schemaContext: ai.buildSchemaContext(sel2.tables),
-    conversationHistory: [],
     databaseName: connection.databaseName,
     engine: normalizeEngine(connection.engine),
   });
@@ -140,7 +139,6 @@ async function main() {
   const gen3 = await safeGenerate({
     userQuestion: q3,
     schemaContext: ai.buildSchemaContext(sel3.tables),
-    conversationHistory: [],
     databaseName: connection.databaseName,
     engine: normalizeEngine(connection.engine),
   });
@@ -227,7 +225,6 @@ async function main() {
   const gen6 = await safeGenerate({
     userQuestion: q6,
     schemaContext: ai.buildSchemaContext(sel6.tables),
-    conversationHistory: [],
     databaseName: connection.databaseName,
     engine: normalizeEngine(connection.engine),
   });
