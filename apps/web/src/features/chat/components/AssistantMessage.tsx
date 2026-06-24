@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import {
-  Sparkles, AlertCircle, Play, Edit2, Check, X,
+  Sparkles, AlertCircle, Check, X,
   BarChart2, Table, ChevronLeft, ChevronRight,
 } from 'lucide-react';
 import {
@@ -14,6 +14,7 @@ import { HelpCircle, Wrench, Table2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { SqlBlock } from './SqlBlock';
 import { useChatStore } from '@/stores/chat.store';
+import { useConnections } from '@/features/connections/hooks/useConnections';
 import { useExecuteSQL, useChooseInterpretation } from '../hooks/useChat';
 import type { Message, QueryResult } from '../types';
 
@@ -34,6 +35,8 @@ const tooltipStyle = {
 export function AssistantMessage({ message, conversationId, connectionId }: Props) {
   const { messageResults, setEditedSQL, getEditedSQL } = useChatStore();
   const executeSQL = useExecuteSQL(conversationId);
+  const { data: connections } = useConnections();
+  const engine = connections?.find((c) => c.id === connectionId)?.engine;
 
   const [isEditing, setIsEditing] = useState(false);
   const [editValue, setEditValue] = useState('');
@@ -114,81 +117,47 @@ export function AssistantMessage({ message, conversationId, connectionId }: Prop
       <Avatar />
       <div className="flex-1 space-y-3 min-w-0">
 
-        {/* SQL Block with edit/execute controls */}
+        {/* Generated-SQL artifact card (premium). Editing swaps in an inline editor. */}
         {message.generatedSql && (
-          <div className="rounded-xl border border-border overflow-hidden">
-            {isEditing ? (
-              <div className="bg-background">
-                <div className="flex items-center justify-between px-4 py-2 bg-muted/50 border-b border-border">
-                  <span className="text-xs font-mono text-amber-600 dark:text-amber-400 font-semibold">EDITING SQL</span>
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={handleSaveEdit}
-                      className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-lg bg-green-500/10 text-green-600 dark:text-green-400 hover:bg-green-500/20 transition-colors"
-                    >
-                      <Check className="w-3 h-3" /> Save
-                    </button>
-                    <button
-                      onClick={() => setIsEditing(false)}
-                      className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-lg hover:bg-accent transition-colors text-muted-foreground"
-                    >
-                      <X className="w-3 h-3" /> Cancel
-                    </button>
-                  </div>
+          isEditing ? (
+            <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-[0_1px_2px_rgba(15,23,42,0.04),0_18px_44px_-28px_rgba(91,79,247,0.28)]">
+              <div className="flex items-center justify-between border-b border-border bg-muted/40 px-4 py-2.5">
+                <span className="text-xs font-mono font-semibold text-amber-600 dark:text-amber-400">EDITING SQL</span>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleSaveEdit}
+                    className="flex items-center gap-1 rounded-lg bg-green-500/10 px-2.5 py-1 text-xs text-green-600 transition-colors hover:bg-green-500/20 dark:text-green-400"
+                  >
+                    <Check className="h-3 w-3" /> Save
+                  </button>
+                  <button
+                    onClick={() => setIsEditing(false)}
+                    className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent"
+                  >
+                    <X className="h-3 w-3" /> Cancel
+                  </button>
                 </div>
-                <textarea
-                  value={editValue}
-                  onChange={(e) => setEditValue(e.target.value)}
-                  rows={6}
-                  className="w-full bg-background px-4 py-3 text-sm font-mono text-foreground outline-none resize-none"
-                  autoFocus
-                />
               </div>
-            ) : (
-              <SqlBlock
-                sql={currentSQL}
-                executionTimeMs={queryResult?.executionTimeMs}
+              <textarea
+                value={editValue}
+                onChange={(e) => setEditValue(e.target.value)}
+                rows={6}
+                className="w-full resize-none bg-background px-4 py-3 font-mono text-sm text-foreground outline-none"
+                autoFocus
               />
-            )}
-
-            {/* Action bar */}
-            {!isEditing && !queryResult && (
-              <div className="flex items-center gap-2 px-4 py-3 bg-muted/20 border-t border-border">
-                <span className="text-xs text-muted-foreground flex-1">
-                  Review the SQL above, then execute or edit it.
-                </span>
-                <button
-                  onClick={handleStartEdit}
-                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-border hover:bg-accent transition-colors text-muted-foreground"
-                >
-                  <Edit2 className="w-3 h-3" /> Edit SQL
-                </button>
-                <button
-                  onClick={() => void handleExecute(1)}
-                  disabled={executeSQL.isPending}
-                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
-                >
-                  {executeSQL.isPending
-                    ? <span className="w-3 h-3 border border-primary-foreground/50 border-t-transparent rounded-full animate-spin" />
-                    : <Play className="w-3 h-3" />
-                  }
-                  {executeSQL.isPending ? 'Running...' : 'Execute'}
-                </button>
-              </div>
-            )}
-
-            {/* Re-run option after results */}
-            {!isEditing && queryResult && (
-              <div className="flex items-center gap-2 px-4 py-2 bg-muted/10 border-t border-border">
-                <button
-                  onClick={handleStartEdit}
-                  className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  <Edit2 className="w-3 h-3" /> Edit & re-run
-                </button>
-              </div>
-            )}
-          </div>
+            </div>
+          ) : (
+            <SqlBlock
+              sql={currentSQL}
+              engine={engine}
+              sourceTables={message.queryMeta?.tables ?? undefined}
+              executionTimeMs={queryResult?.executionTimeMs}
+              hasResult={!!queryResult}
+              isRunning={executeSQL.isPending}
+              onRun={() => void handleExecute(1)}
+              onEdit={handleStartEdit}
+            />
+          )
         )}
 
         {/* Structured output: explanation, confidence, tables/columns touched */}
