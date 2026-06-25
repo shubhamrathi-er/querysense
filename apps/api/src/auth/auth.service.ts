@@ -1,6 +1,6 @@
 import {
   Injectable,
-  ConflictException,
+  BadRequestException,
   UnauthorizedException,
   Logger,
 } from '@nestjs/common';
@@ -28,7 +28,12 @@ export class AuthService {
     });
 
     if (existing) {
-      throw new ConflictException('Email already registered');
+      // Don't confirm the email is already registered (account enumeration).
+      // Log server-side for monitoring; return a generic message to the client.
+      this.logger.warn(`Registration attempt for existing email: ${dto.email}`);
+      throw new BadRequestException(
+        'Registration could not be completed. Please check your details and try again.',
+      );
     }
 
     const passwordHash = await bcrypt.hash(dto.password, 12);
@@ -75,12 +80,12 @@ export class AuthService {
     });
 
     if (!user || !user.passwordHash) {
-      throw new UnauthorizedException('Invalid credentials');
+      throw new UnauthorizedException('Incorrect email or password');
     }
 
     const passwordValid = await bcrypt.compare(dto.password, user.passwordHash);
     if (!passwordValid) {
-      throw new UnauthorizedException('Invalid credentials');
+      throw new UnauthorizedException('Incorrect email or password');
     }
 
     const safeUser = {
