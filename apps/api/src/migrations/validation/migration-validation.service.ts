@@ -26,6 +26,8 @@ import {
   type SourceTableValidation,
   type TargetValidation,
   type SchemaComparison,
+  type IndexSummary,
+  type IndexComparison,
   type DataValidation,
   type DuplicateValidation,
   type ExecutionStep,
@@ -45,6 +47,8 @@ export interface ValidateInput {
   tables: string[];
   allowViews?: boolean;
   mode?: 'append' | 'overwrite';
+  /** Optional source→target table rename (manual table mapping). */
+  tableMappings?: Array<{ source: string; target: string }>;
 }
 
 const INT_TYPES = new Set(['tinyint', 'smallint', 'mediumint', 'int', 'integer', 'bigint']);
@@ -58,6 +62,21 @@ export class MigrationValidationService {
     private prisma: PrismaService,
     private encryption: EncryptionService,
   ) {}
+
+  /** Introspect one table's columns on a connection (used by AI column mapping). */
+  async introspectColumns(
+    workspaceId: string,
+    connectionId: string,
+    table: string,
+  ): Promise<import('./types').ColumnSummary[]> {
+    const a = await this.makeAdapter(connectionId, workspaceId);
+    await a.connect();
+    try {
+      return await a.getColumns(table);
+    } finally {
+      await a.close();
+    }
+  }
 
   /** Quick gate used by the migration runner — true if a BLOCKER exists. */
   async hasBlockingIssues(workspaceId: string, input: ValidateInput): Promise<Issue[]> {
@@ -84,12 +103,13 @@ export class MigrationValidationService {
 
     try {
       const sourceFks = await src.getForeignKeys();
+      const targetOf = this.tableMapper(input.tableMappings);
 
       const sourceValidation = await this.phase1Source(src, sourceFks, input.tables, config, add);
-      const targetValidation = await this.phase2Target(tgt, input.tables, config, add);
-      const schemaComparison = await this.phase3Schema(src, tgt, input.tables, add);
+      const targetValidation = await this.phase2Target(tgt, input.tables, config, add, targetOf);
+      const schemaComparison = await this.phase3Schema(src, tgt, input.tables, add, targetOf);
       const dataValidation = await this.phase45Data(src, input.tables, schemaComparison, add);
-      const duplicateValidation = await this.phase6Duplicates(src, tgt, input.tables, config, add);
+      const duplicateValidation = await this.phase6Duplicates(src, tgt, input.tables, config, add, targetOf);
 
       const dependencyAnalysis = analyzeDependencies(
         input.tables,
@@ -252,6 +272,7 @@ export class MigrationValidationService {
     tables: string[],
     config: ValidationConfig,
     add: (i: Issue) => Issue,
+    targetOf: (t: string) => string = (t) => t,
   ): Promise<TargetValidation> {
     const connectionActive = await tgt.ping();
     const tv: TargetValidation = {
@@ -273,7 +294,7 @@ export class MigrationValidationService {
 
     const tableExistence: boolean[] = [];
     for (const table of tables) {
-      const exists = await tgt.tableExists(table);
+      const exists = await tgt.tableExists(targetOf(table));
       tableExistence.push(exists);
       tv.tables.push({ tableName: table, tableExists: exists, schemaExists: tv.databaseExists });
     }
@@ -293,22 +314,68 @@ export class MigrationValidationService {
     tgt: DialectAdapter,
     tables: string[],
     add: (i: Issue) => Issue,
+    targetOf: (t: string) => string = (t) => t,
   ): Promise<SchemaComparison> {
     const out: SchemaComparison = { tables: [], issues: [] };
     for (const table of tables) {
       if (!(await src.tableExists(table))) continue;
-      const targetExists = await tgt.tableExists(table);
+      const tt = targetOf(table); // mapped target table name
+      const renamed = tt !== table;
+      const targetExists = await tgt.tableExists(tt);
       if (!targetExists) {
-        add({ phase: 'schema', code: 'TARGET_TABLE_WILL_BE_CREATED', severity: Severity.INFO, table, message: `Target table "${table}" will be created from the source.` });
-        out.tables.push({ tableName: table, targetExists: false, columns: [], issues: [] });
+        const into = renamed ? ` (as "${tt}")` : '';
+        add({ phase: 'schema', code: 'TARGET_TABLE_WILL_BE_CREATED', severity: Severity.INFO, table, message: `Target table "${table}"${into} will be created from the source.` });
+        const srcIdx = await src.getIndexes(table);
+        out.tables.push({
+          tableName: table,
+          targetExists: false,
+          columns: [],
+          indexes: srcIdx.map((i) => ({ name: i.name, source: i, target: null, status: 'source-only' as const })),
+          issues: [],
+        });
         continue;
       }
       const srcCols = await src.getColumns(table);
-      const tgtCols = await tgt.getColumns(table);
+      const tgtCols = await tgt.getColumns(tt);
       const { columns, issues } = compareTableColumns(table, srcCols, tgtCols);
       issues.forEach(add);
-      out.tables.push({ tableName: table, targetExists: true, columns, issues });
+      const indexes = this.compareIndexes(
+        await src.getIndexes(table),
+        await tgt.getIndexes(tt),
+      );
+      out.tables.push({ tableName: table, targetExists: true, columns, indexes, issues });
       out.issues.push(...issues);
+    }
+    return out;
+  }
+
+  /** Resolve a source table to its (optionally renamed) target table. */
+  private tableMapper(
+    mappings?: Array<{ source: string; target: string }>,
+  ): (table: string) => string {
+    const map = new Map((mappings ?? []).map((m) => [m.source, m.target]));
+    return (table: string) => map.get(table) ?? table;
+  }
+
+  /** Diff secondary indexes by name (columns + uniqueness). */
+  private compareIndexes(srcIdx: IndexSummary[], tgtIdx: IndexSummary[]): IndexComparison[] {
+    const sMap = new Map(srcIdx.map((i) => [i.name, i]));
+    const tMap = new Map(tgtIdx.map((i) => [i.name, i]));
+    const names = new Set([...sMap.keys(), ...tMap.keys()]);
+    const out: IndexComparison[] = [];
+    for (const name of names) {
+      const source = sMap.get(name) ?? null;
+      const target = tMap.get(name) ?? null;
+      let status: IndexComparison['status'];
+      if (source && !target) status = 'source-only';
+      else if (!source && target) status = 'target-only';
+      else
+        status =
+          source!.unique === target!.unique &&
+          source!.columns.join(',') === target!.columns.join(',')
+            ? 'match'
+            : 'changed';
+      out.push({ name, source, target, status });
     }
     return out;
   }
@@ -367,11 +434,13 @@ export class MigrationValidationService {
     tables: string[],
     config: ValidationConfig,
     add: (i: Issue) => Issue,
+    targetOf: (t: string) => string = (t) => t,
   ): Promise<DuplicateValidation> {
     const out: DuplicateValidation = { tables: [], issues: [] };
     if (config.mode === 'overwrite') return out; // truncate clears the target
     for (const table of tables) {
-      if (!(await tgt.tableExists(table))) continue;
+      const tt = targetOf(table);
+      if (!(await tgt.tableExists(tt))) continue;
       if (!(await src.tableExists(table))) continue;
       const pk = await src.getPrimaryKey(table);
       if (pk.length === 0) {
@@ -379,7 +448,7 @@ export class MigrationValidationService {
         continue;
       }
       const sample = await src.sampleKeys(table, pk, 10000);
-      const probe = await tgt.probeDuplicates(table, pk, sample);
+      const probe = await tgt.probeDuplicates(tt, pk, sample);
       const recommendation: DuplicateRecommendation = probe.count > 0 ? 'UPSERT' : 'SKIP';
       out.tables.push({ tableName: table, duplicateCount: probe.count, sampled: probe.sampled, sampleKeys: probe.sample, recommendation });
       if (probe.count > 0) {
@@ -456,19 +525,26 @@ export class MigrationValidationService {
   // ── Phase 12: post-migration verification ──
   async verify(
     workspaceId: string,
-    input: { sourceConnectionId: string; targetConnectionId: string; tables: string[] },
+    input: {
+      sourceConnectionId: string;
+      targetConnectionId: string;
+      tables: string[];
+      tableMappings?: Array<{ source: string; target: string }>;
+    },
   ): Promise<import('./types').VerificationReport> {
     const src = await this.makeAdapter(input.sourceConnectionId, workspaceId);
     const tgt = await this.makeAdapter(input.targetConnectionId, workspaceId);
+    const targetOf = this.tableMapper(input.tableMappings);
     await src.connect();
     await tgt.connect();
     try {
       const tables: import('./types').TableVerification[] = [];
       for (const table of input.tables) {
+        const tt = targetOf(table);
         const sourceRowCount = await src.getRowCount(table);
-        const targetRowCount = (await tgt.tableExists(table)) ? await tgt.getRowCount(table) : 0;
+        const targetRowCount = (await tgt.tableExists(tt)) ? await tgt.getRowCount(tt) : 0;
         const sourceChecksum = await src.checksum(table);
-        const targetChecksum = await tgt.checksum(table);
+        const targetChecksum = await tgt.checksum(tt);
         const rowCountMatch = sourceRowCount === targetRowCount;
         const checksumMatch =
           sourceChecksum != null && targetChecksum != null

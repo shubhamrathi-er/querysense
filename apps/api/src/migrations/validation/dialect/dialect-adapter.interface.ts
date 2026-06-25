@@ -1,4 +1,4 @@
-import type { ColumnSummary } from '../types';
+import type { ColumnSummary, IndexSummary } from '../types';
 
 export interface GrantInfo {
   select: boolean;
@@ -40,6 +40,8 @@ export interface DialectAdapter {
   getColumns(table: string): Promise<ColumnSummary[]>;
   getPrimaryKey(table: string): Promise<string[]>;
   getUniqueKeys(table: string): Promise<string[][]>;
+  /** Secondary indexes (excludes the primary key). */
+  getIndexes(table: string): Promise<IndexSummary[]>;
   getForeignKeys(): Promise<FkDetail[]>;
 
   getRowCount(table: string): Promise<number>;

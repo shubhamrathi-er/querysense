@@ -4,6 +4,7 @@ import {
   BATCH,
   type BaseTable,
   type Conflict,
+  type CopyOptions,
   type MigrationConn,
   type MigrationDriver,
 } from './migration-driver';
@@ -135,8 +136,8 @@ export class SqlServerMigrationDriver implements MigrationDriver {
     return rows.map((r) => String(r['name']));
   }
 
-  private async columns(table: string): Promise<ColDdl[]> {
-    const rows = await this.sClient.query<Record<string, unknown>>(
+  private async columns(table: string, client: SqlClient = this.sClient): Promise<ColDdl[]> {
+    const rows = await client.query<Record<string, unknown>>(
       `SELECT c.COLUMN_NAME AS name, c.DATA_TYPE AS dataType,
               c.CHARACTER_MAXIMUM_LENGTH AS len, c.NUMERIC_PRECISION AS prec, c.NUMERIC_SCALE AS scale,
               c.IS_NULLABLE AS nullable, c.COLUMN_DEFAULT AS dflt,
@@ -184,10 +185,64 @@ export class SqlServerMigrationDriver implements MigrationDriver {
     return `CREATE TABLE ${tbl(table)} (\n${defs.join(',\n')}\n)`;
   }
 
-  async createTableOnTarget(table: string): Promise<void> {
+  /** Secondary (non-PK) indexes on the source table, columns in key order. */
+  private async sourceIndexes(
+    table: string,
+  ): Promise<Array<{ name: string; columns: string[]; unique: boolean }>> {
+    const rows = await this.sClient.query<Record<string, unknown>>(
+      `SELECT i.name AS name, i.is_unique AS is_unique, c.name AS column_name, ic.key_ordinal AS ord
+       FROM sys.indexes i
+       JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+       JOIN sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id
+       WHERE i.object_id = OBJECT_ID(@p0) AND i.is_primary_key = 0
+         AND i.name IS NOT NULL AND ic.is_included_column = 0
+       ORDER BY i.name, ic.key_ordinal`,
+      [`${SCHEMA}.${table}`],
+    );
+    const map = new Map<string, { name: string; columns: string[]; unique: boolean }>();
+    for (const r of rows) {
+      const name = String(r['name']);
+      if (!map.has(name)) {
+        map.set(name, { name, columns: [], unique: r['is_unique'] === true || r['is_unique'] === 1 });
+      }
+      map.get(name)!.columns.push(String(r['column_name']));
+    }
+    return [...map.values()];
+  }
+
+  private createIndexSql(targetTable: string, ix: { name: string; columns: string[]; unique: boolean }): string {
+    const cols = ix.columns.map(id).join(', ');
+    return `CREATE ${ix.unique ? 'UNIQUE ' : ''}INDEX ${id(ix.name)} ON ${tbl(targetTable)} (${cols})`;
+  }
+
+  async createTableOnTarget(table: string, targetTable: string = table): Promise<void> {
     const cols = await this.columns(table);
     const pk = await this.primaryKey(table);
-    await this.tClient.query(this.buildCreateTable(table, cols, pk));
+    await this.tClient.query(this.buildCreateTable(targetTable, cols, pk));
+    for (const ix of await this.sourceIndexes(table)) {
+      await this.tClient.query(this.createIndexSql(targetTable, ix));
+    }
+  }
+
+  async addColumnsToTarget(table: string, targetTable: string, columns?: string[]): Promise<string[]> {
+    const want = columns ? new Set(columns) : null;
+    const src = await this.columns(table);
+    const existing = new Set((await this.columns(targetTable, this.tClient)).map((c) => c.name));
+    const toAdd = src.filter((c) => (!want || want.has(c.name)) && !c.computed && !existing.has(c.name));
+    for (const c of toAdd) {
+      await this.tClient.query(`ALTER TABLE ${tbl(targetTable)} ADD ${id(c.name)} ${typeString(c)} NULL`);
+    }
+    return toAdd.map((c) => c.name);
+  }
+
+  async scriptAddColumns(table: string, targetTable: string, columns?: string[]): Promise<string[]> {
+    const want = columns ? new Set(columns) : null;
+    const src = await this.columns(table);
+    const existing = new Set((await this.columns(targetTable, this.tClient)).map((c) => c.name));
+    if (existing.size === 0) return []; // target table doesn't exist — nothing to alter
+    return src
+      .filter((c) => (!want || want.has(c.name)) && !c.computed && !existing.has(c.name))
+      .map((c) => `ALTER TABLE ${tbl(targetTable)} ADD ${id(c.name)} ${typeString(c)} NULL;`);
   }
 
   async truncateTarget(table: string): Promise<void> {
@@ -233,14 +288,20 @@ export class SqlServerMigrationDriver implements MigrationDriver {
     table: string,
     conflict: Conflict,
     onProgress: (copied: number, total: number) => void,
+    targetTable: string = table,
+    options?: CopyOptions,
   ): Promise<number> {
-    const { cols, hasIdentity } = await this.insertable(table);
-    if (cols.length === 0) return 0;
+    const ins = await this.insertable(table);
+    const map = options?.columns;
+    const readCols = map ? map.map((m) => m.source) : ins.cols;
+    const writeCols = map ? map.map((m) => m.target) : ins.cols;
+    const hasIdentity = map ? false : ins.hasIdentity;
+    if (readCols.length === 0) return 0;
     const pk = await this.primaryKey(table);
     const total = await this.sourceCount(table);
-    const colList = cols.map(id).join(', ');
+    const colList = readCols.map(id).join(', ');
     // Respect the 1000-row / 2100-param statement limits.
-    const perStmt = Math.max(1, Math.min(1000, Math.floor(2100 / Math.max(1, cols.length))));
+    const perStmt = Math.max(1, Math.min(1000, Math.floor(2100 / Math.max(1, writeCols.length))));
 
     const copied = await this.tClient.transaction(async (tx: SqlExecutor) => {
       let n = 0;
@@ -248,16 +309,16 @@ export class SqlServerMigrationDriver implements MigrationDriver {
       const flush = async (rowsData: unknown[][]) => {
         for (let i = 0; i < rowsData.length; i += perStmt) {
           const chunk = rowsData.slice(i, i + perStmt);
-          const stmt = this.writeStatement(table, cols, pk, conflict, chunk.length);
+          const stmt = this.writeStatement(targetTable, writeCols, pk, conflict, chunk.length);
           // IDENTITY_INSERT is reset between requests, so set it in the same batch.
           const sql = hasIdentity
-            ? `SET IDENTITY_INSERT ${tbl(table)} ON; ${stmt}`
+            ? `SET IDENTITY_INSERT ${tbl(targetTable)} ON; ${stmt}`
             : stmt;
           await tx.query(sql, chunk.flat());
         }
       };
 
-      if (pk.length === 1) {
+      if (pk.length === 1 && readCols.includes(pk[0])) {
         const key = pk[0];
         let last: unknown = null;
         for (;;) {
@@ -268,7 +329,7 @@ export class SqlServerMigrationDriver implements MigrationDriver {
           const params = last === null ? [BATCH] : [last, BATCH];
           const rows = await this.sClient.query<Record<string, unknown>>(sql, params);
           if (rows.length === 0) break;
-          await flush(rows.map((r) => cols.map((c) => r[c])));
+          await flush(rows.map((r) => readCols.map((c) => r[c])));
           n += rows.length;
           last = rows[rows.length - 1][key];
           onProgress(n, total);
@@ -282,7 +343,7 @@ export class SqlServerMigrationDriver implements MigrationDriver {
             [offset, BATCH],
           );
           if (rows.length === 0) break;
-          await flush(rows.map((r) => cols.map((c) => r[c])));
+          await flush(rows.map((r) => readCols.map((c) => r[c])));
           n += rows.length;
           offset += rows.length;
           onProgress(n, total);
@@ -296,7 +357,7 @@ export class SqlServerMigrationDriver implements MigrationDriver {
     // Reseed identity so future inserts don't collide with copied values.
     if (hasIdentity) {
       try {
-        await this.tClient.query(`DBCC CHECKIDENT ('${SCHEMA}.${table}', RESEED)`);
+        await this.tClient.query(`DBCC CHECKIDENT ('${SCHEMA}.${targetTable}', RESEED)`);
       } catch {
         /* best-effort */
       }
@@ -319,12 +380,14 @@ export class SqlServerMigrationDriver implements MigrationDriver {
     return ['SET NOCOUNT OFF;'];
   }
 
-  async scriptCreateTable(table: string): Promise<string[]> {
+  async scriptCreateTable(table: string, targetTable: string = table): Promise<string[]> {
     const cols = await this.columns(table);
     const pk = await this.primaryKey(table);
+    const idx = (await this.sourceIndexes(table)).map((ix) => `${this.createIndexSql(targetTable, ix)};`);
     return [
-      `IF OBJECT_ID('${SCHEMA}.${table}', 'U') IS NOT NULL DROP TABLE ${tbl(table)};`,
-      `${this.buildCreateTable(table, cols, pk)};`,
+      `IF OBJECT_ID('${SCHEMA}.${targetTable}', 'U') IS NOT NULL DROP TABLE ${tbl(targetTable)};`,
+      `${this.buildCreateTable(targetTable, cols, pk)};`,
+      ...idx,
       '',
     ];
   }
@@ -344,12 +407,17 @@ export class SqlServerMigrationDriver implements MigrationDriver {
     return `N'${String(v).replace(/'/g, "''")}'`;
   }
 
-  async scriptInserts(table: string, conflict: Conflict, rowCap: number) {
-    const { cols, hasIdentity } = await this.insertable(table);
+  async scriptInserts(table: string, conflict: Conflict, rowCap: number, targetTable: string = table, options?: CopyOptions) {
+    const ins = await this.insertable(table);
+    const map = options?.columns;
+    const readCols = map ? map.map((m) => m.source) : ins.cols;
+    const writeCols = map ? map.map((m) => m.target) : ins.cols;
+    const hasIdentity = map ? false : ins.hasIdentity;
     const lines: string[] = [];
-    if (cols.length === 0) return { lines, rows: 0, truncated: false };
-    const colList = cols.map(id).join(', ');
-    if (hasIdentity) lines.push(`SET IDENTITY_INSERT ${tbl(table)} ON;`);
+    if (readCols.length === 0) return { lines, rows: 0, truncated: false };
+    const readList = readCols.map(id).join(', ');
+    const writeList = writeCols.map(id).join(', ');
+    if (hasIdentity) lines.push(`SET IDENTITY_INSERT ${tbl(targetTable)} ON;`);
 
     let offset = 0;
     let rows = 0;
@@ -361,19 +429,19 @@ export class SqlServerMigrationDriver implements MigrationDriver {
         break;
       }
       const data = await this.sClient.query<Record<string, unknown>>(
-        `SELECT ${colList} FROM ${tbl(table)} ORDER BY (SELECT NULL) OFFSET @p0 ROWS FETCH NEXT @p1 ROWS ONLY`,
+        `SELECT ${readList} FROM ${tbl(table)} ORDER BY (SELECT NULL) OFFSET @p0 ROWS FETCH NEXT @p1 ROWS ONLY`,
         [offset, BATCH],
       );
       if (data.length === 0) break;
       const tuples = data
-        .map((r) => `(${cols.map((c) => this.literal(r[c])).join(', ')})`)
+        .map((r) => `(${readCols.map((c) => this.literal(r[c])).join(', ')})`)
         .join(',\n  ');
-      lines.push(`INSERT INTO ${tbl(table)} (${colList}) VALUES\n  ${tuples};`);
+      lines.push(`INSERT INTO ${tbl(targetTable)} (${writeList}) VALUES\n  ${tuples};`);
       rows += data.length;
       offset += data.length;
       if (data.length < BATCH) break;
     }
-    if (hasIdentity) lines.push(`SET IDENTITY_INSERT ${tbl(table)} OFF;`);
+    if (hasIdentity) lines.push(`SET IDENTITY_INSERT ${tbl(targetTable)} OFF;`);
     lines.push('');
     return { lines, rows, truncated };
   }

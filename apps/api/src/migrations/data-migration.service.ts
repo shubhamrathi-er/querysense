@@ -22,6 +22,7 @@ import {
 import { PrismaService } from '../../prisma/prisma.service';
 import { EncryptionService } from '../common/encryption/encryption.service';
 import { MigrationValidationService } from './validation/migration-validation.service';
+import { AiOrchestratorService } from '../ai/ai-orchestrator.service';
 
 interface ConnInfo {
   engine: DbEngine;
@@ -45,7 +46,57 @@ export class DataMigrationService {
     private prisma: PrismaService,
     private encryption: EncryptionService,
     private validation: MigrationValidationService,
+    private ai: AiOrchestratorService,
   ) {}
+
+  // ─── Column mapping suggestion (AI + heuristic fallback) ──
+
+  async suggestColumnMapping(
+    workspaceId: string,
+    dto: { sourceConnectionId: string; targetConnectionId: string; sourceTable: string; targetTable?: string },
+  ): Promise<{
+    source: Array<{ name: string; type: string }>;
+    target: Array<{ name: string; type: string }>;
+    mapping: Array<{ source: string; target: string | null }>;
+    aiUsed: boolean;
+  }> {
+    const targetTable = dto.targetTable || dto.sourceTable;
+    const [srcCols, tgtCols] = await Promise.all([
+      this.validation.introspectColumns(workspaceId, dto.sourceConnectionId, dto.sourceTable),
+      this.validation.introspectColumns(workspaceId, dto.targetConnectionId, targetTable),
+    ]);
+    const source = srcCols.map((c) => ({ name: c.name, type: c.columnType || c.dataType }));
+    const target = tgtCols.map((c) => ({ name: c.name, type: c.columnType || c.dataType }));
+
+    let mapping: Array<{ source: string; target: string | null }>;
+    let aiUsed = true;
+    try {
+      mapping = await this.ai.suggestColumnMapping(dto.sourceTable, source, target);
+      // Ensure every source column is represented (AI may omit some).
+      const seen = new Set(mapping.map((m) => m.source));
+      const heuristic = this.heuristicColumnMapping(source, target);
+      for (const h of heuristic) if (!seen.has(h.source)) mapping.push(h);
+    } catch {
+      aiUsed = false;
+      mapping = this.heuristicColumnMapping(source, target);
+    }
+    return { source, target, mapping, aiUsed };
+  }
+
+  /** Deterministic name-based fallback: exact → case-insensitive → normalised. */
+  private heuristicColumnMapping(
+    source: Array<{ name: string }>,
+    target: Array<{ name: string }>,
+  ): Array<{ source: string; target: string | null }> {
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const exact = new Map(target.map((t) => [t.name, t.name]));
+    const ci = new Map(target.map((t) => [t.name.toLowerCase(), t.name]));
+    const nm = new Map(target.map((t) => [norm(t.name), t.name]));
+    return source.map((s) => ({
+      source: s.name,
+      target: exact.get(s.name) ?? ci.get(s.name.toLowerCase()) ?? nm.get(norm(s.name)) ?? null,
+    }));
+  }
 
   // ─── Plan (dry-run preview) ──────────────────────────────
 
@@ -104,6 +155,10 @@ export class DataMigrationService {
       tables: string[];
       createTables: boolean;
       conflict: Conflict;
+      tableMappings?: Array<{ source: string; target: string }>;
+      columnMappings?: Array<{ table: string; columns: Array<{ source: string; target: string }> }>;
+      addColumns?: Array<{ table: string; columns: string[] }>;
+      createMissingColumns?: boolean;
     },
   ): Promise<{ sql: string; truncated: boolean; rowsIncluded: number }> {
     const source = await this.load(dto.sourceConnectionId, workspaceId);
@@ -116,21 +171,42 @@ export class DataMigrationService {
     );
     await driver.openSource();
 
+    // Emitting ALTER ... ADD COLUMN needs to introspect the live target to know
+    // what's missing — only open it when the script will actually need it.
+    const needTarget =
+      !dto.createTables &&
+      (dto.createMissingColumns !== false || (dto.addColumns?.length ?? 0) > 0);
+    if (needTarget) await driver.openTarget();
+
     try {
       const ordered = await this.orderTables(driver, dto.tables);
+      const targetOf = this.targetMapper(dto.tableMappings);
+      const colMapOf = this.columnMapper(dto.columnMappings);
+      const addColsOf = this.addColumnsMapper(dto.addColumns);
       const parts: string[] = driver.scriptHeader(source.name, source.databaseName);
       let rowsIncluded = 0;
       let truncated = false;
 
       for (const table of ordered) {
         this.assertIdent(table);
+        const target = targetOf(table);
+        this.assertIdent(target);
         if (dto.createTables) {
-          parts.push(...(await driver.scriptCreateTable(table)));
+          parts.push(...(await driver.scriptCreateTable(table, target)));
+        } else if (needTarget) {
+          // Target assumed to exist — add missing columns before the inserts.
+          const add = addColsOf(table);
+          if (add?.length) {
+            add.forEach((c) => this.assertIdent(c));
+            parts.push(...(await driver.scriptAddColumns(table, target, add)));
+          } else if (dto.createMissingColumns !== false && !colMapOf(table)) {
+            parts.push(...(await driver.scriptAddColumns(table, target)));
+          }
         }
         if (dto.conflict === 'truncate') {
-          parts.push(driver.scriptTruncate(table));
+          parts.push(driver.scriptTruncate(target));
         }
-        const ins = await driver.scriptInserts(table, dto.conflict, SCRIPT_ROW_CAP);
+        const ins = await driver.scriptInserts(table, dto.conflict, SCRIPT_ROW_CAP, target, { columns: colMapOf(table) });
         parts.push(...ins.lines);
         rowsIncluded += ins.rows;
         truncated = truncated || ins.truncated;
@@ -154,6 +230,10 @@ export class DataMigrationService {
       createTables: boolean;
       conflict: Conflict;
       skipValidation?: boolean;
+      tableMappings?: Array<{ source: string; target: string }>;
+      columnMappings?: Array<{ table: string; columns: Array<{ source: string; target: string }> }>;
+      addColumns?: Array<{ table: string; columns: string[] }>;
+      createMissingColumns?: boolean;
     },
     res: Response,
   ): Promise<void> {
@@ -172,6 +252,7 @@ export class DataMigrationService {
           targetConnectionId: dto.targetConnectionId,
           tables: dto.tables,
           mode: dto.conflict === 'truncate' ? 'overwrite' : 'append',
+          tableMappings: dto.tableMappings,
         });
         if (blockers.length > 0) {
           send('error', {
@@ -214,32 +295,55 @@ export class DataMigrationService {
       await driver.openTarget();
 
       const ordered = await this.orderTables(driver, dto.tables);
+      const targetOf = this.targetMapper(dto.tableMappings);
+      const colMapOf = this.columnMapper(dto.columnMappings);
+      const addColsOf = this.addColumnsMapper(dto.addColumns);
       const targetExisting = new Set(
         (await driver.targetBaseTables()).map((t) => t.name),
       );
 
       for (const table of ordered) {
         this.assertIdent(table);
+        const target = targetOf(table);
+        this.assertIdent(target);
         send('table', { table, status: 'start' });
         try {
-          if (dto.createTables && !targetExisting.has(table)) {
-            await driver.createTableOnTarget(table);
-            send('table', { table, status: 'created' });
+          if (!targetExisting.has(target)) {
+            if (dto.createTables) {
+              await driver.createTableOnTarget(table, target);
+              send('table', { table, status: 'created' });
+            }
+          } else {
+            // Existing target — add missing columns before copy.
+            const add = addColsOf(table);
+            if (add?.length) {
+              // Explicit per-column choices (from the mapping UI).
+              add.forEach((c) => this.assertIdent(c));
+              const added = await driver.addColumnsToTarget(table, target, add);
+              if (added.length) send('table', { table, status: 'altered', columns: added });
+            } else if (dto.createMissingColumns && !colMapOf(table)) {
+              // Default: auto-create every source column missing on the target,
+              // unless the user has explicitly mapped this table's columns.
+              const added = await driver.addColumnsToTarget(table, target);
+              if (added.length) send('table', { table, status: 'altered', columns: added });
+            }
           }
           if (dto.conflict === 'truncate') {
-            await driver.truncateTarget(table);
+            await driver.truncateTarget(target);
           }
 
           const copied = await driver.copyTable(
             table,
             dto.conflict,
             (n, total) => send('progress', { table, copied: n, total }),
+            target,
+            { columns: colMapOf(table) },
           );
 
           const sourceRows = await driver.sourceCount(table);
-          const targetRows = await driver.targetCount(table);
+          const targetRows = await driver.targetCount(target);
           report.push({ table, copied, sourceRows, targetRows, status: 'done' });
-          send('table', { table, status: 'done', copied, sourceRows, targetRows });
+          send('table', { table, status: 'done', copied, sourceRows, targetRows, target });
         } catch (err) {
           const msg = err instanceof Error ? err.message : 'copy failed';
           report.push({ table, copied: 0, sourceRows: 0, targetRows: 0, status: 'error', error: msg });
@@ -260,6 +364,36 @@ export class DataMigrationService {
   }
 
   // ─── Orchestration helpers (engine-agnostic) ─────────────
+
+  /** Build a source→target resolver from optional table mappings (identity by default). */
+  private targetMapper(
+    mappings?: Array<{ source: string; target: string }>,
+  ): (table: string) => string {
+    const map = new Map((mappings ?? []).map((m) => [m.source, m.target]));
+    return (table: string) => map.get(table) ?? table;
+  }
+
+  /** Resolve a source table's explicit column map (undefined = copy all by name). */
+  private columnMapper(
+    mappings?: Array<{ table: string; columns: Array<{ source: string; target: string }> }>,
+  ): (table: string) => Array<{ source: string; target: string }> | undefined {
+    const map = new Map((mappings ?? []).map((m) => [m.table, m.columns]));
+    return (table: string) => {
+      const cols = map.get(table);
+      return cols && cols.length > 0 ? cols : undefined;
+    };
+  }
+
+  /** Resolve a source table's "create these missing columns on target" list. */
+  private addColumnsMapper(
+    addColumns?: Array<{ table: string; columns: string[] }>,
+  ): (table: string) => string[] | undefined {
+    const map = new Map((addColumns ?? []).map((a) => [a.table, a.columns]));
+    return (table: string) => {
+      const cols = map.get(table);
+      return cols && cols.length > 0 ? cols : undefined;
+    };
+  }
 
   private async orderTables(
     driver: MigrationDriver,

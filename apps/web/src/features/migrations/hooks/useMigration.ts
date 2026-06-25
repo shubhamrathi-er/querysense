@@ -29,6 +29,7 @@ export const useValidateMigration = () => {
       targetConnectionId: string;
       tables: string[];
       mode?: 'append' | 'overwrite';
+      tableMappings?: Array<{ source: string; target: string }>;
     }) => migrationsApi.validate(workspaceId, payload),
   });
 };

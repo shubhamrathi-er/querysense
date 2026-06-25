@@ -397,6 +397,81 @@ export class AiOrchestratorService {
   }
 
   /**
+   * Suggest a source→target column mapping for a migration. For each source
+   * column the model picks the best target column (by name + type) or null to
+   * skip it. Throws if all providers fail (caller can fall back to a heuristic).
+   */
+  async suggestColumnMapping(
+    table: string,
+    sourceCols: Array<{ name: string; type: string }>,
+    targetCols: Array<{ name: string; type: string }>,
+  ): Promise<Array<{ source: string; target: string | null }>> {
+    const fmt = (c: { name: string; type: string }) => `${c.name} (${c.type})`;
+    const messages: ChatMessage[] = [
+      {
+        role: 'system',
+        content:
+          'You map columns from a SOURCE database table to a TARGET table for data migration. ' +
+          'For each source column, choose the best-matching target column by name and type, or null to skip it. ' +
+          'Use ONLY target column names from the provided list; never invent names. ' +
+          'Respond with ONLY a JSON array — no prose, no markdown fences.\n' +
+          'Schema: [{"source": <sourceColumn>, "target": <targetColumn|null>}]',
+      },
+      {
+        role: 'user',
+        content: `Table: ${table}\n\nSource columns:\n${sourceCols.map(fmt).join('\n')}\n\nTarget columns:\n${targetCols.map(fmt).join('\n')}\n\nReturn only the JSON array.`,
+      },
+    ];
+
+    const validSources = new Set(sourceCols.map((c) => c.name));
+    const validTargets = new Set(targetCols.map((c) => c.name));
+    const providers = [this.groq, this.openRouter, this.gemini];
+    for (const provider of providers) {
+      if (!this.hasApiKey(provider.name)) continue;
+      try {
+        const result = await provider.complete(messages);
+        const parsed = this.parseColumnMapping(result.content, validSources, validTargets);
+        if (parsed && parsed.length) return parsed;
+      } catch (error) {
+        this.logger.warn(
+          `Column mapping via ${provider.name} failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+        );
+        continue;
+      }
+    }
+    throw new ServiceUnavailableException(
+      'Could not suggest a column mapping. All AI providers failed or are not configured.',
+    );
+  }
+
+  private parseColumnMapping(
+    content: string,
+    validSources: Set<string>,
+    validTargets: Set<string>,
+  ): Array<{ source: string; target: string | null }> | null {
+    const start = content.indexOf('[');
+    const end = content.lastIndexOf(']');
+    if (start === -1 || end === -1 || end < start) return null;
+    let arr: unknown;
+    try {
+      arr = JSON.parse(content.slice(start, end + 1));
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(arr)) return null;
+    const out: Array<{ source: string; target: string | null }> = [];
+    for (const item of arr) {
+      const r = item as { source?: unknown; target?: unknown };
+      const source = typeof r.source === 'string' ? r.source : null;
+      if (!source || !validSources.has(source)) continue;
+      const target =
+        typeof r.target === 'string' && validTargets.has(r.target) ? r.target : null;
+      out.push({ source, target });
+    }
+    return out;
+  }
+
+  /**
    * Ask the model for higher-level schema best-practice issues that the
    * deterministic rules can't catch (normalization, design smells, etc.).
    */

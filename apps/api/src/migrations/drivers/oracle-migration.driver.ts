@@ -4,6 +4,7 @@ import {
   BATCH,
   type BaseTable,
   type Conflict,
+  type CopyOptions,
   type MigrationConn,
   type MigrationDriver,
 } from './migration-driver';
@@ -126,8 +127,8 @@ export class OracleMigrationDriver implements MigrationDriver {
     return rows.map((r) => String(r['name']));
   }
 
-  private async columns(table: string): Promise<ColDdl[]> {
-    const rows = await this.sClient.query<Record<string, unknown>>(
+  private async columns(table: string, client: SqlClient = this.sClient): Promise<ColDdl[]> {
+    const rows = await client.query<Record<string, unknown>>(
       `SELECT column_name AS "name", data_type AS "dataType",
               char_length AS "charLen", data_length AS "dataLen",
               data_precision AS "prec", data_scale AS "scale",
@@ -176,10 +177,71 @@ export class OracleMigrationDriver implements MigrationDriver {
     return `CREATE TABLE ${id(table)} (\n${defs.join(',\n')}\n)`;
   }
 
-  async createTableOnTarget(table: string): Promise<void> {
+  /** Secondary (non-PK) indexes on the source table, columns in position order. */
+  private async sourceIndexes(
+    table: string,
+  ): Promise<Array<{ name: string; columns: string[]; unique: boolean }>> {
+    const rows = await this.sClient.query<Record<string, unknown>>(
+      `SELECT i.index_name AS "name", i.uniqueness AS "uniq",
+              c.column_name AS "col", c.column_position AS "pos"
+       FROM user_indexes i
+       JOIN user_ind_columns c ON c.index_name = i.index_name
+       WHERE i.table_name = :1
+         AND NOT EXISTS (
+           SELECT 1 FROM user_constraints uc
+           WHERE uc.index_name = i.index_name AND uc.constraint_type = 'P'
+         )
+       ORDER BY i.index_name, c.column_position`,
+      [table],
+    );
+    const map = new Map<string, { name: string; columns: string[]; unique: boolean }>();
+    for (const r of rows) {
+      const name = String(r['name']);
+      if (!map.has(name)) map.set(name, { name, columns: [], unique: String(r['uniq']) === 'UNIQUE' });
+      map.get(name)!.columns.push(String(r['col']));
+    }
+    return [...map.values()];
+  }
+
+  private createIndexSql(targetTable: string, ix: { name: string; columns: string[]; unique: boolean }): string {
+    const cols = ix.columns.map(id).join(', ');
+    return `CREATE ${ix.unique ? 'UNIQUE ' : ''}INDEX ${id(ix.name)} ON ${id(targetTable)} (${cols})`;
+  }
+
+  async createTableOnTarget(table: string, targetTable: string = table): Promise<void> {
     const cols = await this.columns(table);
     const pk = await this.primaryKey(table);
-    await this.tClient.query(this.buildCreateTable(table, cols, pk));
+    await this.tClient.query(this.buildCreateTable(targetTable, cols, pk));
+    for (const ix of await this.sourceIndexes(table)) {
+      // Index names are schema-global in Oracle — best-effort so a name clash
+      // doesn't abort the migration.
+      try {
+        await this.tClient.query(this.createIndexSql(targetTable, ix));
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+
+  async addColumnsToTarget(table: string, targetTable: string, columns?: string[]): Promise<string[]> {
+    const want = columns ? new Set(columns) : null;
+    const src = await this.columns(table);
+    const existing = new Set((await this.columns(targetTable, this.tClient)).map((c) => c.name));
+    const toAdd = src.filter((c) => (!want || want.has(c.name)) && !c.virtual && !existing.has(c.name));
+    for (const c of toAdd) {
+      await this.tClient.query(`ALTER TABLE ${id(targetTable)} ADD (${id(c.name)} ${typeString(c)})`);
+    }
+    return toAdd.map((c) => c.name);
+  }
+
+  async scriptAddColumns(table: string, targetTable: string, columns?: string[]): Promise<string[]> {
+    const want = columns ? new Set(columns) : null;
+    const src = await this.columns(table);
+    const existing = new Set((await this.columns(targetTable, this.tClient)).map((c) => c.name));
+    if (existing.size === 0) return []; // target table doesn't exist — nothing to alter
+    return src
+      .filter((c) => (!want || want.has(c.name)) && !c.virtual && !existing.has(c.name))
+      .map((c) => `ALTER TABLE ${id(targetTable)} ADD (${id(c.name)} ${typeString(c)});`);
   }
 
   async truncateTarget(table: string): Promise<void> {
@@ -206,14 +268,20 @@ export class OracleMigrationDriver implements MigrationDriver {
     table: string,
     conflict: Conflict,
     onProgress: (copied: number, total: number) => void,
+    targetTable: string = table,
+    options?: CopyOptions,
   ): Promise<number> {
-    const { cols, identityCols } = await this.insertable(table);
-    if (cols.length === 0) return 0;
+    const ins = await this.insertable(table);
+    const map = options?.columns;
+    const readCols = map ? map.map((m) => m.source) : ins.cols;
+    const writeCols = map ? map.map((m) => m.target) : ins.cols;
+    const reseq = map ? [] : ins.identityCols;
+    if (readCols.length === 0) return 0;
     const pk = await this.primaryKey(table);
-    const pkIdx = pk.map((c) => cols.indexOf(c));
+    const pkIdx = pk.map((c) => readCols.indexOf(c));
     const total = await this.sourceCount(table);
-    const colList = cols.map(id).join(', ');
-    const dedup = (conflict === 'skip' || conflict === 'upsert') && pk.length > 0;
+    const colList = readCols.map(id).join(', ');
+    const dedup = (conflict === 'skip' || conflict === 'upsert') && pk.length > 0 && pkIdx.every((i) => i >= 0);
 
     const copied = await this.tClient.transaction(async (tx: SqlExecutor) => {
       let n = 0;
@@ -224,7 +292,7 @@ export class OracleMigrationDriver implements MigrationDriver {
           const tuples = rows.map((r) => pkIdx.map((i) => r[i]));
           const { sql, binds } = this.keyIn(pk, tuples);
           const existing = await tx.query<Record<string, unknown>>(
-            `SELECT ${pk.map(id).join(', ')} FROM ${id(table)} WHERE ${sql}`,
+            `SELECT ${pk.map(id).join(', ')} FROM ${id(targetTable)} WHERE ${sql}`,
             binds,
           );
           const seen = new Set(
@@ -233,17 +301,17 @@ export class OracleMigrationDriver implements MigrationDriver {
           if (conflict === 'upsert' && seen.size > 0) {
             // Replace existing rows: delete the matches, then insert all.
             const del = this.keyIn(pk, [...seen].map((s) => JSON.parse(s)));
-            await tx.query(`DELETE FROM ${id(table)} WHERE ${del.sql}`, del.binds);
+            await tx.query(`DELETE FROM ${id(targetTable)} WHERE ${del.sql}`, del.binds);
           } else if (conflict === 'skip') {
             rows = rows.filter(
               (r) => !seen.has(JSON.stringify(pkIdx.map((i) => r[i] ?? null))),
             );
           }
         }
-        if (rows.length) await tx.bulkInsert(id(table), cols.map(id), rows);
+        if (rows.length) await tx.bulkInsert(id(targetTable), writeCols.map(id), rows);
       };
 
-      if (pk.length === 1) {
+      if (pk.length === 1 && readCols.includes(pk[0])) {
         const key = pk[0];
         let last: unknown = null;
         for (;;) {
@@ -254,7 +322,7 @@ export class OracleMigrationDriver implements MigrationDriver {
           const params = last === null ? [BATCH] : [last, BATCH];
           const rows = await this.sClient.query<Record<string, unknown>>(sql, params);
           if (rows.length === 0) break;
-          await flush(rows.map((r) => cols.map((c) => r[c])));
+          await flush(rows.map((r) => readCols.map((c) => r[c])));
           n += rows.length;
           last = rows[rows.length - 1][key];
           onProgress(n, total);
@@ -268,7 +336,7 @@ export class OracleMigrationDriver implements MigrationDriver {
             [offset, BATCH],
           );
           if (rows.length === 0) break;
-          await flush(rows.map((r) => cols.map((c) => r[c])));
+          await flush(rows.map((r) => readCols.map((c) => r[c])));
           n += rows.length;
           offset += rows.length;
           onProgress(n, total);
@@ -279,10 +347,10 @@ export class OracleMigrationDriver implements MigrationDriver {
     });
 
     // Reseed identity columns so future inserts continue past the copied values.
-    for (const col of identityCols) {
+    for (const col of reseq) {
       try {
         await this.tClient.query(
-          `ALTER TABLE ${id(table)} MODIFY (${id(col)} GENERATED BY DEFAULT AS IDENTITY (START WITH LIMIT VALUE))`,
+          `ALTER TABLE ${id(targetTable)} MODIFY (${id(col)} GENERATED BY DEFAULT AS IDENTITY (START WITH LIMIT VALUE))`,
         );
       } catch {
         /* best-effort */
@@ -305,13 +373,15 @@ export class OracleMigrationDriver implements MigrationDriver {
     return ['COMMIT;'];
   }
 
-  async scriptCreateTable(table: string): Promise<string[]> {
+  async scriptCreateTable(table: string, targetTable: string = table): Promise<string[]> {
     const cols = await this.columns(table);
     const pk = await this.primaryKey(table);
+    const idx = (await this.sourceIndexes(table)).map((ix) => `${this.createIndexSql(targetTable, ix)};`);
     return [
-      `BEGIN EXECUTE IMMEDIATE 'DROP TABLE ${id(table)} CASCADE CONSTRAINTS'; EXCEPTION WHEN OTHERS THEN NULL; END;`,
+      `BEGIN EXECUTE IMMEDIATE 'DROP TABLE ${id(targetTable)} CASCADE CONSTRAINTS'; EXCEPTION WHEN OTHERS THEN NULL; END;`,
       '/',
-      `${this.buildCreateTable(table, cols, pk)};`,
+      `${this.buildCreateTable(targetTable, cols, pk)};`,
+      ...idx,
       '',
     ];
   }
@@ -330,11 +400,15 @@ export class OracleMigrationDriver implements MigrationDriver {
     return `'${String(v).replace(/'/g, "''")}'`;
   }
 
-  async scriptInserts(table: string, _conflict: Conflict, rowCap: number) {
-    const { cols } = await this.insertable(table);
+  async scriptInserts(table: string, _conflict: Conflict, rowCap: number, targetTable: string = table, options?: CopyOptions) {
+    const ins = await this.insertable(table);
+    const map = options?.columns;
+    const readCols = map ? map.map((m) => m.source) : ins.cols;
+    const writeCols = map ? map.map((m) => m.target) : ins.cols;
     const lines: string[] = [];
-    if (cols.length === 0) return { lines, rows: 0, truncated: false };
-    const colList = cols.map(id).join(', ');
+    if (readCols.length === 0) return { lines, rows: 0, truncated: false };
+    const readList = readCols.map(id).join(', ');
+    const writeList = writeCols.map(id).join(', ');
 
     let offset = 0;
     let rows = 0;
@@ -346,13 +420,13 @@ export class OracleMigrationDriver implements MigrationDriver {
         break;
       }
       const data = await this.sClient.query<Record<string, unknown>>(
-        `SELECT ${colList} FROM ${id(table)} ORDER BY ROWID OFFSET :1 ROWS FETCH NEXT :2 ROWS ONLY`,
+        `SELECT ${readList} FROM ${id(table)} ORDER BY ROWID OFFSET :1 ROWS FETCH NEXT :2 ROWS ONLY`,
         [offset, BATCH],
       );
       if (data.length === 0) break;
       for (const r of data) {
-        const vals = cols.map((c) => this.literal(r[c])).join(', ');
-        lines.push(`INSERT INTO ${id(table)} (${colList}) VALUES (${vals});`);
+        const vals = readCols.map((c) => this.literal(r[c])).join(', ');
+        lines.push(`INSERT INTO ${id(targetTable)} (${writeList}) VALUES (${vals});`);
       }
       rows += data.length;
       offset += data.length;

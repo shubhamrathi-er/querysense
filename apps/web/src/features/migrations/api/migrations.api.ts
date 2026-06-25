@@ -11,6 +11,38 @@ interface ApiResponse<T> {
   data: T;
 }
 
+export interface TableMapping {
+  source: string;
+  target: string;
+}
+
+export interface ColumnMapping {
+  source: string;
+  target: string;
+}
+
+export interface TableColumnMapping {
+  table: string;
+  columns: ColumnMapping[];
+}
+
+export interface TableAddColumns {
+  table: string;
+  columns: string[];
+}
+
+export interface ColumnInfo {
+  name: string;
+  type: string;
+}
+
+export interface SuggestColumnsResult {
+  source: ColumnInfo[];
+  target: ColumnInfo[];
+  mapping: Array<{ source: string; target: string | null }>;
+  aiUsed: boolean;
+}
+
 export interface RunPayload {
   sourceConnectionId: string;
   targetConnectionId: string;
@@ -18,6 +50,10 @@ export interface RunPayload {
   createTables: boolean;
   conflict: Conflict;
   skipValidation?: boolean;
+  createMissingColumns?: boolean;
+  tableMappings?: TableMapping[];
+  columnMappings?: TableColumnMapping[];
+  addColumns?: TableAddColumns[];
 }
 
 export const migrationsApi = {
@@ -33,6 +69,22 @@ export const migrationsApi = {
     return res.data;
   },
 
+  suggestColumns: async (
+    workspaceId: string,
+    payload: {
+      sourceConnectionId: string;
+      targetConnectionId: string;
+      sourceTable: string;
+      targetTable?: string;
+    },
+  ): Promise<SuggestColumnsResult> => {
+    const res = (await apiClient.post(
+      `/workspaces/${workspaceId}/migrations/suggest-columns`,
+      payload,
+    )) as ApiResponse<SuggestColumnsResult>;
+    return res.data;
+  },
+
   validate: async (
     workspaceId: string,
     payload: {
@@ -41,6 +93,7 @@ export const migrationsApi = {
       tables: string[];
       mode?: 'append' | 'overwrite';
       allowViews?: boolean;
+      tableMappings?: TableMapping[];
     },
   ): Promise<ValidationReport> => {
     const res = (await apiClient.post(

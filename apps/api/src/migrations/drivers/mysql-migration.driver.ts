@@ -6,6 +6,7 @@ import {
   BATCH,
   type BaseTable,
   type Conflict,
+  type CopyOptions,
   type MigrationConn,
   type MigrationDriver,
 } from './migration-driver';
@@ -141,14 +142,68 @@ export class MysqlMigrationDriver implements MigrationDriver {
       .map((r) => String((r as Record<string, unknown>)['COLUMN_NAME']));
   }
 
-  async createTableOnTarget(table: string): Promise<void> {
+  /** Column name + full COLUMN_TYPE (e.g. `varchar(50)`), excluding generated cols. */
+  private async columnDefs(
+    database: string,
+    pool: mysql.Pool,
+    table: string,
+  ): Promise<Array<{ name: string; columnType: string }>> {
+    const [rows] = await pool.query<mysql.RowDataPacket[]>(
+      `SELECT COLUMN_NAME, COLUMN_TYPE, EXTRA FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`,
+      [database, table],
+    );
+    return rows
+      .filter(
+        (r) =>
+          !String((r as Record<string, unknown>)['EXTRA'] ?? '')
+            .toUpperCase()
+            .includes('GENERATED'),
+      )
+      .map((r) => ({
+        name: String((r as Record<string, unknown>)['COLUMN_NAME']),
+        columnType: String((r as Record<string, unknown>)['COLUMN_TYPE']),
+      }));
+  }
+
+  async addColumnsToTarget(table: string, targetTable: string, columns?: string[]): Promise<string[]> {
+    const want = columns ? new Set(columns) : null;
+    const src = await this.columnDefs(this.source.database, this.sPool, table);
+    const existing = new Set(
+      (await this.columnDefs(this.target.database, this.tPool, targetTable)).map((c) => c.name),
+    );
+    const toAdd = src.filter((c) => (!want || want.has(c.name)) && !existing.has(c.name));
+    for (const c of toAdd) {
+      await this.tConn.query(`ALTER TABLE ${id(targetTable)} ADD COLUMN ${id(c.name)} ${c.columnType}`);
+    }
+    return toAdd.map((c) => c.name);
+  }
+
+  async scriptAddColumns(table: string, targetTable: string, columns?: string[]): Promise<string[]> {
+    const want = columns ? new Set(columns) : null;
+    const src = await this.columnDefs(this.source.database, this.sPool, table);
+    const existing = new Set(
+      (await this.columnDefs(this.target.database, this.tPool, targetTable)).map((c) => c.name),
+    );
+    if (existing.size === 0) return []; // target table doesn't exist — nothing to alter
+    return src
+      .filter((c) => (!want || want.has(c.name)) && !existing.has(c.name))
+      .map((c) => `ALTER TABLE ${id(targetTable)} ADD COLUMN ${id(c.name)} ${c.columnType};`);
+  }
+
+  /** Rewrite the leading `CREATE TABLE \`name\`` so the DDL targets a new name. */
+  private renameCreate(ddl: string, targetTable: string): string {
+    return ddl.replace(/^CREATE TABLE\s+`[^`]+`/i, `CREATE TABLE ${id(targetTable)}`);
+  }
+
+  async createTableOnTarget(table: string, targetTable: string = table): Promise<void> {
     const sConn = await this.sPool.getConnection();
     try {
       const [rows] = await sConn.query<mysql.RowDataPacket[]>(
         `SHOW CREATE TABLE ${id(table)}`,
       );
       const ddl = String((rows[0] as Record<string, unknown>)['Create Table'] ?? '');
-      await this.tConn.query(ddl);
+      await this.tConn.query(this.renameCreate(ddl, targetTable));
     } finally {
       sConn.release();
     }
@@ -183,23 +238,29 @@ export class MysqlMigrationDriver implements MigrationDriver {
     table: string,
     conflict: Conflict,
     onProgress: (copied: number, total: number) => void,
+    targetTable: string = table,
+    options?: CopyOptions,
   ): Promise<number> {
-    const cols = await this.insertableColumns(table);
-    if (cols.length === 0) return 0;
+    const readCols = options?.columns
+      ? options.columns.map((m) => m.source)
+      : await this.insertableColumns(table);
+    const writeCols = options?.columns ? options.columns.map((m) => m.target) : readCols;
+    if (readCols.length === 0) return 0;
     const pk = await this.primaryKey(table);
     const total = await this.sourceCount(table);
-    const colList = cols.map(id).join(', ');
-    const insertSql = this.insertTemplate(conflict, table, cols);
+    const colList = readCols.map(id).join(', ');
+    const insertSql = this.insertTemplate(conflict, targetTable, writeCols);
 
     const insertBatch = async (rows: mysql.RowDataPacket[]) => {
       const values = rows.map((r) =>
-        cols.map((c) => this.normalizeValue((r as Record<string, unknown>)[c])),
+        readCols.map((c) => this.normalizeValue((r as Record<string, unknown>)[c])),
       );
       await this.tConn.query(insertSql, [values]);
     };
 
     let copied = 0;
-    if (pk.length === 1) {
+    // Keyset paging needs the PK in the read set; otherwise fall back to OFFSET.
+    if (pk.length === 1 && readCols.includes(pk[0])) {
       const key = pk[0];
       let last: unknown = null;
       for (;;) {
@@ -248,24 +309,30 @@ export class MysqlMigrationDriver implements MigrationDriver {
     return ['SET FOREIGN_KEY_CHECKS=1;'];
   }
 
-  async scriptCreateTable(table: string): Promise<string[]> {
+  async scriptCreateTable(table: string, targetTable: string = table): Promise<string[]> {
     const [rows] = await this.sPool.query<mysql.RowDataPacket[]>(
       `SHOW CREATE TABLE ${id(table)}`,
     );
-    const ddl = String((rows[0] as Record<string, unknown>)['Create Table'] ?? '');
-    return [`DROP TABLE IF EXISTS ${id(table)};`, `${ddl};`, ''];
+    const ddl = this.renameCreate(
+      String((rows[0] as Record<string, unknown>)['Create Table'] ?? ''),
+      targetTable,
+    );
+    return [`DROP TABLE IF EXISTS ${id(targetTable)};`, `${ddl};`, ''];
   }
 
   scriptTruncate(table: string): string {
     return `TRUNCATE TABLE ${id(table)};`;
   }
 
-  async scriptInserts(table: string, conflict: Conflict, rowCap: number) {
-    const cols = await this.insertableColumns(table);
+  async scriptInserts(table: string, conflict: Conflict, rowCap: number, targetTable: string = table, options?: CopyOptions) {
+    const readCols = options?.columns
+      ? options.columns.map((m) => m.source)
+      : await this.insertableColumns(table);
+    const writeCols = options?.columns ? options.columns.map((m) => m.target) : readCols;
     const lines: string[] = [];
-    if (cols.length === 0) return { lines, rows: 0, truncated: false };
-    const insertSql = this.insertTemplate(conflict, table, cols);
-    const colList = cols.map(id).join(', ');
+    if (readCols.length === 0) return { lines, rows: 0, truncated: false };
+    const insertSql = this.insertTemplate(conflict, targetTable, writeCols);
+    const colList = readCols.map(id).join(', ');
 
     let offset = 0;
     let rows = 0;
@@ -284,7 +351,7 @@ export class MysqlMigrationDriver implements MigrationDriver {
       );
       if (data.length === 0) break;
       const values = data.map((r) =>
-        cols.map((c) => this.normalizeValue((r as Record<string, unknown>)[c])),
+        readCols.map((c) => this.normalizeValue((r as Record<string, unknown>)[c])),
       );
       lines.push(format(insertSql, [values] as never) + ';');
       rows += data.length;

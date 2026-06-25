@@ -24,6 +24,22 @@ export const BATCH = 2000;
 /** Hard cap on rows embedded per table in a generated SQL script. */
 export const SCRIPT_ROW_CAP = 100_000;
 
+/** Explicit source→target column mapping for one table. */
+export interface ColumnMapping {
+  source: string;
+  target: string;
+}
+
+/**
+ * Per-table copy options (extensible). When `columns` is set, ONLY those source
+ * columns are copied — each into its mapped target column — and any source
+ * column not listed is ignored. When omitted, all insertable columns are copied
+ * by name (the default). Future options (row filters, transforms) extend here.
+ */
+export interface CopyOptions {
+  columns?: ColumnMapping[];
+}
+
 /**
  * Engine strategy for data migration between two same-engine connections. Owns
  * the source (read) pool and the target (write) session; the service handles
@@ -47,26 +63,42 @@ export interface MigrationDriver {
   targetCount(table: string): Promise<number>;
 
   // ── schema prep on target (createTables flow) ──
-  createTableOnTarget(table: string): Promise<void>;
+  // `targetTable` defaults to `table`; pass a different name to migrate into a
+  // differently-named target table (manual table mapping). Reads always use the
+  // source `table`; writes use `targetTable`.
+  createTableOnTarget(table: string, targetTable?: string): Promise<void>;
   truncateTarget(table: string): Promise<void>;
+
+  // ── add missing columns to an existing target table (ALTER ADD COLUMN) ──
+  // Adds source columns (nullable) to `targetTable` if absent. When `columns`
+  // is omitted, ALL source columns missing on the target are added.
+  // Returns the columns actually added.
+  addColumnsToTarget(table: string, targetTable: string, columns?: string[]): Promise<string[]>;
 
   // ── copy one table's data; returns rows copied ──
   copyTable(
     table: string,
     conflict: Conflict,
     onProgress: (copied: number, total: number) => void,
+    targetTable?: string,
+    options?: CopyOptions,
   ): Promise<number>;
 
   // ── SQL-script generation (source only) ──
   scriptHeader(sourceName: string, sourceDb: string): string[];
   scriptFooter(): string[];
-  /** DROP + CREATE statements for one table. */
-  scriptCreateTable(table: string): Promise<string[]>;
+  /** DROP + CREATE statements for one table (renamed to `targetTable`). */
+  scriptCreateTable(table: string, targetTable?: string): Promise<string[]>;
+  /** ALTER ... ADD COLUMN statements for missing columns on `targetTable`.
+   *  Omit `columns` to emit all source columns missing on the target. */
+  scriptAddColumns(table: string, targetTable: string, columns?: string[]): Promise<string[]>;
   scriptTruncate(table: string): string;
   /** INSERT statements for a table's data, capped at rowCap rows. */
   scriptInserts(
     table: string,
     conflict: Conflict,
     rowCap: number,
+    targetTable?: string,
+    options?: CopyOptions,
   ): Promise<{ lines: string[]; rows: number; truncated: boolean }>;
 }

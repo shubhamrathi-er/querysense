@@ -1,6 +1,6 @@
 import { createPool, type SqlClient, type SshConfig } from '../../../common/db/mysql-pool';
 import { quoteIdent } from '../../../common/db/engine';
-import type { ColumnSummary } from '../types';
+import type { ColumnSummary, IndexSummary } from '../types';
 import type {
   DialectAdapter,
   FkDetail,
@@ -156,6 +156,31 @@ export class OracleAdapter implements DialectAdapter {
       const k = String(r['cn']);
       if (!map.has(k)) map.set(k, []);
       map.get(k)!.push(String(r['col']));
+    }
+    return [...map.values()];
+  }
+
+  async getIndexes(table: string): Promise<IndexSummary[]> {
+    const rows = await this.q(
+      `SELECT i.index_name AS "name", i.uniqueness AS "uniq",
+              c.column_name AS "col", c.column_position AS "pos"
+       FROM user_indexes i
+       JOIN user_ind_columns c ON c.index_name = i.index_name
+       WHERE i.table_name = :1
+         AND NOT EXISTS (
+           SELECT 1 FROM user_constraints uc
+           WHERE uc.index_name = i.index_name AND uc.constraint_type = 'P'
+         )
+       ORDER BY i.index_name, c.column_position`,
+      [table],
+    );
+    const map = new Map<string, IndexSummary>();
+    for (const r of rows) {
+      const name = String(r['name']);
+      if (!map.has(name)) {
+        map.set(name, { name, columns: [], unique: String(r['uniq']) === 'UNIQUE' });
+      }
+      map.get(name)!.columns.push(String(r['col']));
     }
     return [...map.values()];
   }

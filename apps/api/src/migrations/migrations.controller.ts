@@ -14,6 +14,7 @@ import {
   MigrationPlanDto,
   MigrationRunDto,
   ValidateMigrationDto,
+  SuggestColumnsDto,
 } from './dto/migration.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { WorkspaceMemberGuard } from '../workspaces/guards/workspace-member.guard';
@@ -47,7 +48,17 @@ export class MigrationsController {
       sourceConnectionId: dto.sourceConnectionId,
       targetConnectionId: dto.targetConnectionId,
       tables: dto.tables,
+      tableMappings: dto.tableMappings,
     });
+  }
+
+  @Post('suggest-columns')
+  @ApiOperation({ summary: 'Suggest a source→target column mapping (AI + heuristic)' })
+  suggestColumns(
+    @Param('workspaceId') workspaceId: string,
+    @Body() dto: SuggestColumnsDto,
+  ) {
+    return this.migrationService.suggestColumnMapping(workspaceId, dto);
   }
 
   @Post('plan')
@@ -75,6 +86,10 @@ export class MigrationsController {
       tables: dto.tables,
       createTables: dto.createTables ?? true,
       conflict: dto.conflict ?? 'skip',
+      tableMappings: dto.tableMappings,
+      columnMappings: dto.columnMappings,
+      addColumns: dto.addColumns,
+      createMissingColumns: dto.createMissingColumns ?? true,
     });
   }
 
@@ -94,6 +109,10 @@ export class MigrationsController {
         createTables: dto.createTables ?? true,
         conflict: dto.conflict ?? 'skip',
         skipValidation: dto.skipValidation ?? false,
+        tableMappings: dto.tableMappings,
+        columnMappings: dto.columnMappings,
+        addColumns: dto.addColumns,
+        createMissingColumns: dto.createMissingColumns ?? true,
       },
       res,
     );

@@ -1,7 +1,7 @@
 import { Pool as PgPool } from 'pg';
 import { createPostgresPool, type SshConfig } from '../../../common/db/mysql-pool';
 import { quoteIdent } from '../../../common/db/engine';
-import type { ColumnSummary } from '../types';
+import type { ColumnSummary, IndexSummary } from '../types';
 import type {
   DialectAdapter,
   FkDetail,
@@ -202,6 +202,30 @@ export class PostgresAdapter implements DialectAdapter {
       const k = String(r['constraint_name']);
       if (!map.has(k)) map.set(k, []);
       map.get(k)!.push(String(r['column_name']));
+    }
+    return [...map.values()];
+  }
+
+  async getIndexes(table: string): Promise<IndexSummary[]> {
+    const rows = await this.q(
+      `SELECT i.relname AS name, ix.indisunique AS is_unique, a.attname AS column_name, k.ord
+       FROM pg_class t
+       JOIN pg_namespace n ON n.oid = t.relnamespace AND n.nspname = current_schema()
+       JOIN pg_index ix ON ix.indrelid = t.oid AND NOT ix.indisprimary
+       JOIN pg_class i ON i.oid = ix.indexrelid
+       JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+       JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+       WHERE t.relname = $1
+       ORDER BY i.relname, k.ord`,
+      [table],
+    );
+    const map = new Map<string, IndexSummary>();
+    for (const r of rows) {
+      const name = String(r['name']);
+      if (!map.has(name)) {
+        map.set(name, { name, columns: [], unique: r['is_unique'] === true });
+      }
+      map.get(name)!.columns.push(String(r['column_name']));
     }
     return [...map.values()];
   }

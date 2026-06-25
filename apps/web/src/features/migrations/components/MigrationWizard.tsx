@@ -4,7 +4,7 @@ import { useMemo, useRef, useState } from 'react';
 import {
   X, ArrowRight, ArrowLeft, ArrowDown, Database, Loader2, Download, Copy, Check,
   AlertTriangle, CheckCircle2, Play, FileCode, ShieldAlert, ShieldCheck, Info, ListOrdered,
-  Lock, Zap, Clock, Table2, Settings2, Search,
+  Lock, Zap, Clock, Table2, Settings2, Search, GitCompare, ChevronRight, Sparkles,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Select } from '@/components/ui/select';
@@ -13,13 +13,14 @@ import { useToast } from '@/components/ui/toast';
 import { useConnections } from '@/features/connections/hooks/useConnections';
 import { engineLabel, type DatabaseEngine, type Connection } from '@/features/connections/types';
 import { EngineIcon } from './EngineIcon';
+import { SchemaDiff } from './SchemaDiff';
 import { useWorkspaceStore } from '@/stores/workspace.store';
 import {
   usePlanMigration,
   useGenerateScript,
   useValidateMigration,
 } from '../hooks/useMigration';
-import { migrationsApi, type RunPayload } from '../api/migrations.api';
+import { migrationsApi, type RunPayload, type ColumnInfo } from '../api/migrations.api';
 import type {
   MigrationPlan, Conflict, ScriptResult, RunReportRow, TableState,
   ValidationReport, ValidationIssue, Severity,
@@ -32,9 +33,9 @@ interface Props {
 type Step = 'select' | 'configure' | 'validate' | 'script' | 'run';
 
 // Shared column template so the header and every row align exactly:
-// checkbox · table name (flex) · source rows · target rows · status.
+// checkbox · source table · target table · source rows · target rows · status.
 const TABLE_GRID =
-  'grid grid-cols-[1.25rem_minmax(0,1fr)_5rem_5rem_5.5rem] items-center gap-3';
+  'grid grid-cols-[1.25rem_minmax(0,1fr)_minmax(0,1fr)_3.75rem_3.75rem_4.75rem] items-center gap-2';
 
 const CONFLICT_DESC: Record<Conflict, string> = {
   skip: 'Existing rows in the target with the same primary key will be skipped.',
@@ -89,9 +90,17 @@ export function MigrationWizard({ onClose }: Props) {
   const [planData, setPlanData] = useState<MigrationPlan | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [createTables, setCreateTables] = useState(true);
+  const [createMissingColumns, setCreateMissingColumns] = useState(true);
   const [conflict, setConflict] = useState<Conflict>('skip');
   const [tableSearch, setTableSearch] = useState('');
   const [tableFilter, setTableFilter] = useState<'all' | 'new' | 'existing'>('all');
+  // Per-source-table target name (manual table mapping); identity unless renamed.
+  const [tableTargets, setTableTargets] = useState<Record<string, string>>({});
+  // Column mapping (manual): which table's panel is open, fetched columns, and the map.
+  const [colPanel, setColPanel] = useState<string | null>(null);
+  const [colData, setColData] = useState<Record<string, { source: ColumnInfo[]; target: ColumnInfo[] }>>({});
+  const [colLoading, setColLoading] = useState<string | null>(null);
+  const [columnMaps, setColumnMaps] = useState<Record<string, Array<{ source: string; target: string | null }>>>({});
 
   const [scriptResult, setScriptResult] = useState<ScriptResult | null>(null);
   const [copied, setCopied] = useState(false);
@@ -118,13 +127,84 @@ export function MigrationWizard({ onClose }: Props) {
     return true;
   });
 
+  // Only send entries where the target name was actually changed from the source.
+  const buildMappings = () =>
+    orderedSelected
+      .map((t) => ({ source: t, target: (tableTargets[t] ?? t).trim() }))
+      .filter((m) => m.target && m.target !== m.source);
+
+  // Only tables the user explicitly configured get a column map (others copy all).
+  const buildColumnMappings = () =>
+    orderedSelected
+      .filter((t) => columnMaps[t])
+      .map((t) => ({
+        table: t,
+        columns: columnMaps[t]
+          .filter((c) => c.target)
+          .map((c) => ({ source: c.source, target: c.target as string })),
+      }))
+      .filter((m) => m.columns.length > 0);
+
+  // Columns mapped to a target that doesn't exist yet ⇒ create them (ALTER ADD).
+  const buildAddColumns = () =>
+    orderedSelected
+      .filter((t) => columnMaps[t] && colData[t])
+      .map((t) => {
+        const existing = new Set(colData[t].target.map((c) => c.name));
+        return {
+          table: t,
+          columns: columnMaps[t].filter((c) => c.target && !existing.has(c.target)).map((c) => c.source),
+        };
+      })
+      .filter((m) => m.columns.length > 0);
+
   const payload = (): RunPayload => ({
     sourceConnectionId: sourceId,
     targetConnectionId: targetId,
     tables: orderedSelected,
     createTables,
+    createMissingColumns,
     conflict,
+    tableMappings: buildMappings(),
+    columnMappings: buildColumnMappings(),
+    addColumns: buildAddColumns(),
   });
+
+  const loadColumns = async (table: string) => {
+    setColLoading(table);
+    try {
+      const r = await migrationsApi.suggestColumns(currentWorkspace?.id ?? '', {
+        sourceConnectionId: sourceId,
+        targetConnectionId: targetId,
+        sourceTable: table,
+        targetTable: (tableTargets[table] ?? table).trim() || table,
+      });
+      setColData((d) => ({ ...d, [table]: { source: r.source, target: r.target } }));
+      // Default an unmatched source column to "create on target" (target = its own
+      // name), not ignore — migrations should carry data across by default.
+      const withCreateDefault = r.mapping.map((m) => ({
+        source: m.source,
+        target: m.target ?? m.source,
+      }));
+      setColumnMaps((m) => ({ ...m, [table]: withCreateDefault }));
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setColLoading(null);
+    }
+  };
+
+  const toggleColPanel = (table: string) => {
+    if (colPanel === table) { setColPanel(null); return; }
+    setColPanel(table);
+    if (!colData[table]) void loadColumns(table);
+  };
+
+  const setColTarget = (table: string, source: string, target: string | null) =>
+    setColumnMaps((m) => ({
+      ...m,
+      [table]: (m[table] ?? []).map((c) => (c.source === source ? { ...c, target } : c)),
+    }));
 
   const handlePreview = () => {
     plan.mutate(
@@ -155,6 +235,7 @@ export function MigrationWizard({ onClose }: Props) {
         targetConnectionId: targetId,
         tables: orderedSelected,
         mode: conflict === 'truncate' ? 'overwrite' : 'append',
+        tableMappings: buildMappings(),
       },
       {
         onSuccess: (r) => {
@@ -415,6 +496,24 @@ export function MigrationWizard({ onClose }: Props) {
                   </div>
                 </div>
                 <div className="flex items-start gap-3 rounded-xl border border-border bg-card/60 p-3.5">
+                  <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm font-medium text-foreground">Create missing columns</p>
+                      <button
+                        onClick={() => setCreateMissingColumns((v) => !v)}
+                        className={cn(
+                          'rounded-full px-2 py-0.5 text-[10px] font-semibold transition-colors',
+                          createMissingColumns ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' : 'bg-muted text-muted-foreground',
+                        )}
+                      >
+                        {createMissingColumns ? 'Enabled' : 'Disabled'}
+                      </button>
+                    </div>
+                    <p className="mt-0.5 text-xs text-muted-foreground">Source columns absent on an existing target table are added automatically. Override per-column below.</p>
+                  </div>
+                </div>
+                <div className="flex items-start gap-3 rounded-xl border border-border bg-card/60 p-3.5">
                   <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
@@ -470,36 +569,79 @@ export function MigrationWizard({ onClose }: Props) {
 
                 <div className={cn(TABLE_GRID, 'px-3 py-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground')}>
                   <span />
-                  <span>Table name</span>
-                  <span className="text-right">Source rows</span>
-                  <span className="text-right">Target rows</span>
+                  <span>Source table</span>
+                  <span>Target table</span>
+                  <span className="text-right">Src rows</span>
+                  <span className="text-right">Tgt rows</span>
                   <span className="text-center">Status</span>
                 </div>
                 <div className="max-h-[34vh] overflow-y-auto">
                   {visibleTables.length === 0 ? (
                     <p className="px-3 py-6 text-center text-xs text-muted-foreground">No tables match this filter.</p>
                   ) : (
-                    visibleTables.map((t) => (
-                      <label
-                        key={t.tableName}
-                        className={cn(TABLE_GRID, 'cursor-pointer items-center border-t border-border/40 px-3 py-2 text-xs hover:bg-accent/30')}
-                      >
-                        <input type="checkbox" checked={selected.has(t.tableName)} onChange={() => toggle(t.tableName)} className="accent-primary" />
-                        <span className="flex min-w-0 items-center gap-2">
-                          <Table2 className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                          <span className="truncate font-mono text-foreground">{t.tableName}</span>
-                        </span>
-                        <span className="text-right tabular-nums text-muted-foreground">{t.sourceRows.toLocaleString()}</span>
-                        <span className="text-right tabular-nums text-muted-foreground">{t.existsOnTarget ? (t.targetRows ?? 0).toLocaleString() : '—'}</span>
-                        <span className="flex justify-center">
-                          {t.existsOnTarget ? (
-                            <span className="rounded-full bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium text-sky-600 dark:text-sky-400">Existing</span>
-                          ) : (
-                            <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">New</span>
+                    visibleTables.map((t) => {
+                      const target = tableTargets[t.tableName] ?? t.tableName;
+                      const renamed = target.trim() !== '' && target.trim() !== t.tableName;
+                      const mapped = (columnMaps[t.tableName] ?? []).filter((c) => c.target).length;
+                      const ignored = (columnMaps[t.tableName] ?? []).filter((c) => !c.target).length;
+                      return (
+                        <div key={t.tableName} className="border-t border-border/40">
+                          <div className={cn(TABLE_GRID, 'px-3 py-2 text-xs hover:bg-accent/30')}>
+                            <input type="checkbox" checked={selected.has(t.tableName)} onChange={() => toggle(t.tableName)} className="accent-primary" />
+                            <span className="flex min-w-0 items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => toggleColPanel(t.tableName)}
+                                aria-label={`Map columns for ${t.tableName}`}
+                                className="shrink-0 text-muted-foreground hover:text-foreground"
+                              >
+                                <ChevronRight className={cn('h-3.5 w-3.5 transition-transform', colPanel === t.tableName && 'rotate-90')} />
+                              </button>
+                              <Table2 className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                              <button type="button" onClick={() => toggle(t.tableName)} className="truncate text-left font-mono text-foreground">
+                                {t.tableName}
+                              </button>
+                              {ignored > 0 && (
+                                <span className="shrink-0 rounded bg-muted px-1 text-[9px] text-muted-foreground" title={`${mapped} mapped, ${ignored} ignored`}>
+                                  {mapped}/{mapped + ignored} cols
+                                </span>
+                              )}
+                            </span>
+                            <input
+                              value={target}
+                              onChange={(e) => setTableTargets((m) => ({ ...m, [t.tableName]: e.target.value }))}
+                              aria-label={`Target table for ${t.tableName}`}
+                              spellCheck={false}
+                              className={cn(
+                                'w-full rounded border bg-background px-1.5 py-1 font-mono text-[11px] outline-none focus:border-primary/40',
+                                renamed ? 'border-primary/40 text-primary' : 'border-border text-muted-foreground',
+                              )}
+                            />
+                            <span className="text-right tabular-nums text-muted-foreground">{t.sourceRows.toLocaleString()}</span>
+                            <span className="text-right tabular-nums text-muted-foreground">{!renamed && t.existsOnTarget ? (t.targetRows ?? 0).toLocaleString() : '—'}</span>
+                            <span className="flex justify-center">
+                              {renamed ? (
+                                <span className="rounded-full bg-violet-500/10 px-2 py-0.5 text-[10px] font-medium text-violet-600 dark:text-violet-400">Renamed</span>
+                              ) : t.existsOnTarget ? (
+                                <span className="rounded-full bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium text-sky-600 dark:text-sky-400">Existing</span>
+                              ) : (
+                                <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">New</span>
+                              )}
+                            </span>
+                          </div>
+                          {colPanel === t.tableName && (
+                            <ColumnMapPanel
+                              table={t.tableName}
+                              data={colData[t.tableName]}
+                              map={columnMaps[t.tableName]}
+                              loading={colLoading === t.tableName}
+                              onSuggest={() => void loadColumns(t.tableName)}
+                              onSet={(src, tgt) => setColTarget(t.tableName, src, tgt)}
+                            />
                           )}
-                        </span>
-                      </label>
-                    ))
+                        </div>
+                      );
+                    })
                   )}
                 </div>
               </div>
@@ -567,6 +709,17 @@ export function MigrationWizard({ onClose }: Props) {
                   validationReport.allIssues.map((iss, i) => <IssueRow key={i} issue={iss} />)
                 )}
               </div>
+
+              {validationReport.schemaComparison && validationReport.schemaComparison.tables.length > 0 && (
+                <details className="text-xs" open>
+                  <summary className="mb-2 flex cursor-pointer items-center gap-1.5 text-muted-foreground">
+                    <GitCompare className="h-3.5 w-3.5" /> Schema diff ({validationReport.schemaComparison.tables.length} table{validationReport.schemaComparison.tables.length !== 1 ? 's' : ''})
+                  </summary>
+                  <div className="max-h-[40vh] overflow-y-auto pr-1">
+                    <SchemaDiff report={validationReport} />
+                  </div>
+                </details>
+              )}
 
               <details className="text-xs">
                 <summary className="cursor-pointer text-muted-foreground flex items-center gap-1.5">
@@ -712,7 +865,7 @@ function Stepper({ step }: { step: Step }) {
   // Select (0) → Review plan / configure (1) → Confirm & run / validate·script·run (2).
   const current = step === 'select' ? 0 : step === 'configure' ? 1 : 2;
   return (
-    <div className="mt-4 flex items-center">
+    <div className="mt-8 flex items-center">
       {STEPPER.map((s, i) => {
         const done = i < current;
         const active = i === current;
@@ -773,13 +926,15 @@ function SummaryStat({
   sub: string;
 }) {
   return (
-    <div className="rounded-xl border border-border bg-card/60 p-3.5">
-      <div className={cn('flex h-9 w-9 items-center justify-center rounded-lg', STAT_TINT[tint])}>
-        <Icon className="h-5 w-5" />
+    <div className="flex items-center gap-4 rounded-xl border border-border bg-card/60 p-3.5">
+      <div className={cn('flex h-14 w-14 items-center justify-center rounded-lg', STAT_TINT[tint])}>
+        <Icon className="h-8 w-8" />
       </div>
-      <p className="mt-2.5 text-xl font-bold tracking-tight text-foreground">{value}</p>
-      <p className="text-xs font-medium text-foreground">{label}</p>
-      <p className="text-[11px] text-muted-foreground">{sub}</p>
+      <div>
+        <p className="text-xl font-bold tracking-tight text-foreground">{value}</p>
+        <p className="text-xs font-medium text-foreground">{label}</p>
+        <p className="text-[11px] text-muted-foreground">{sub}</p>
+      </div>
     </div>
   );
 }
@@ -819,6 +974,97 @@ function FilterTab({ active, onClick, children }: { active: boolean; onClick: ()
     >
       {children}
     </button>
+  );
+}
+
+const IGNORE = '__ignore__';
+const CREATE = '__create__';
+
+function ColumnMapPanel({
+  data,
+  map,
+  loading,
+  onSuggest,
+  onSet,
+}: {
+  table: string;
+  data?: { source: ColumnInfo[]; target: ColumnInfo[] };
+  map?: Array<{ source: string; target: string | null }>;
+  loading: boolean;
+  onSuggest: () => void;
+  onSet: (source: string, target: string | null) => void;
+}) {
+  const targetOf = (col: string) => map?.find((m) => m.source === col)?.target ?? null;
+  const existing = new Set((data?.target ?? []).map((c) => c.name));
+
+  return (
+    <div className="border-t border-border/40 bg-muted/20 px-3 py-3">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+          Column mapping {data && <span className="font-normal normal-case">· map, ignore, or create on target</span>}
+        </span>
+        <button
+          type="button"
+          onClick={onSuggest}
+          disabled={loading}
+          className="flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-[11px] font-medium text-foreground transition-colors hover:bg-accent disabled:opacity-50"
+        >
+          {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <Sparkles className="h-3 w-3 text-primary" />}
+          AI suggest
+        </button>
+      </div>
+
+      {loading && !data ? (
+        <div className="space-y-1.5">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="h-6 animate-pulse rounded bg-muted/60" />
+          ))}
+        </div>
+      ) : !data ? (
+        <p className="py-2 text-center text-xs text-muted-foreground">Couldn’t load columns.</p>
+      ) : (
+        <div className="space-y-1">
+          {data.source.map((sc) => {
+            const tgt = targetOf(sc.name);
+            // tgt set but not an existing target column ⇒ it will be created.
+            const willCreate = !!tgt && !existing.has(tgt);
+            const selectValue = tgt == null ? IGNORE : willCreate ? CREATE : tgt;
+            return (
+              <div key={sc.name} className="grid grid-cols-[minmax(0,1fr)_1rem_minmax(0,1fr)] items-center gap-2 text-xs">
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <span className="truncate font-mono text-foreground">{sc.name}</span>
+                  <code className="shrink-0 rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">{sc.type}</code>
+                </span>
+                <ArrowRight className="h-3 w-3 text-muted-foreground" />
+                <select
+                  value={selectValue}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    onSet(sc.name, v === IGNORE ? null : v === CREATE ? sc.name : v);
+                  }}
+                  className={cn(
+                    'w-full rounded border bg-background px-1.5 py-1 font-mono text-[11px] outline-none focus:border-primary/40',
+                    willCreate
+                      ? 'border-violet-500/40 text-violet-600 dark:text-violet-400'
+                      : tgt
+                        ? 'border-border text-foreground'
+                        : 'border-amber-500/40 text-amber-600 dark:text-amber-400',
+                  )}
+                >
+                  <option value={IGNORE}>— Ignore (don’t copy) —</option>
+                  {data.target.map((tc) => (
+                    <option key={tc.name} value={tc.name}>
+                      {tc.name} ({tc.type})
+                    </option>
+                  ))}
+                  <option value={CREATE}>➕ Create “{sc.name}” on target</option>
+                </select>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 

@@ -1,6 +1,6 @@
 import * as mysql from 'mysql2/promise';
 import { createMysqlPool, type SshConfig } from '../../../common/db/mysql-pool';
-import type { ColumnSummary } from '../types';
+import type { ColumnSummary, IndexSummary } from '../types';
 import type {
   DialectAdapter,
   FkDetail,
@@ -159,6 +159,25 @@ export class MysqlAdapter implements DialectAdapter {
       const k = String(r['INDEX_NAME']);
       if (!map.has(k)) map.set(k, []);
       map.get(k)!.push(String(r['COLUMN_NAME']));
+    }
+    return [...map.values()];
+  }
+
+  async getIndexes(table: string): Promise<IndexSummary[]> {
+    const rows = await this.q(
+      `SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, SEQ_IN_INDEX
+       FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND INDEX_NAME <> 'PRIMARY'
+       ORDER BY INDEX_NAME, SEQ_IN_INDEX`,
+      [this.db, table],
+    );
+    const map = new Map<string, IndexSummary>();
+    for (const r of rows) {
+      const name = String(r['INDEX_NAME']);
+      if (!map.has(name)) {
+        map.set(name, { name, columns: [], unique: Number(r['NON_UNIQUE']) === 0 });
+      }
+      map.get(name)!.columns.push(String(r['COLUMN_NAME']));
     }
     return [...map.values()];
   }

@@ -108,10 +108,24 @@ export interface ColumnComparison {
   changes: Issue[];
 }
 
+export interface IndexSummary {
+  name: string;
+  columns: string[];
+  unique: boolean;
+}
+
+export interface IndexComparison {
+  name: string;
+  source: IndexSummary | null;
+  target: IndexSummary | null;
+  status: 'match' | 'changed' | 'source-only' | 'target-only';
+}
+
 export interface TableSchemaComparison {
   tableName: string;
   targetExists: boolean;
   columns: ColumnComparison[];
+  indexes: IndexComparison[];
   issues: Issue[];
 }
 

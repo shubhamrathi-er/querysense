@@ -1,6 +1,6 @@
 import { createPool, type SqlClient, type SshConfig } from '../../../common/db/mysql-pool';
 import { quoteIdent } from '../../../common/db/engine';
-import type { ColumnSummary } from '../types';
+import type { ColumnSummary, IndexSummary } from '../types';
 import type {
   DialectAdapter,
   FkDetail,
@@ -167,6 +167,28 @@ export class SqlServerAdapter implements DialectAdapter {
       const k = String(r['cn']);
       if (!map.has(k)) map.set(k, []);
       map.get(k)!.push(String(r['col']));
+    }
+    return [...map.values()];
+  }
+
+  async getIndexes(table: string): Promise<IndexSummary[]> {
+    const rows = await this.q(
+      `SELECT i.name AS name, i.is_unique AS is_unique, c.name AS column_name, ic.key_ordinal AS ord
+       FROM sys.indexes i
+       JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+       JOIN sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id
+       WHERE i.object_id = OBJECT_ID(@p0) AND i.is_primary_key = 0
+         AND i.name IS NOT NULL AND ic.is_included_column = 0
+       ORDER BY i.name, ic.key_ordinal`,
+      [table],
+    );
+    const map = new Map<string, IndexSummary>();
+    for (const r of rows) {
+      const name = String(r['name']);
+      if (!map.has(name)) {
+        map.set(name, { name, columns: [], unique: r['is_unique'] === true || r['is_unique'] === 1 });
+      }
+      map.get(name)!.columns.push(String(r['column_name']));
     }
     return [...map.values()];
   }
