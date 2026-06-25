@@ -100,6 +100,31 @@ export class AuthService {
     return { user: safeUser, ...tokens };
   }
 
+  /**
+   * Exchange a valid refresh token for a fresh access + refresh token pair
+   * (rotation). Lets a session live for the refresh window without re-login.
+   */
+  async refresh(refreshToken: string) {
+    let payload: JwtPayload;
+    try {
+      payload = await this.jwtService.verifyAsync<JwtPayload>(refreshToken, {
+        secret: this.config.get('JWT_REFRESH_SECRET'),
+      });
+    } catch {
+      throw new UnauthorizedException('Session expired. Please sign in again.');
+    }
+
+    // Ensure the user still exists (revocation via account deletion).
+    const user = await this.prisma.user.findUnique({
+      where: { id: payload.sub },
+    });
+    if (!user) {
+      throw new UnauthorizedException('Session expired. Please sign in again.');
+    }
+
+    return this.generateTokens(user.id, user.email);
+  }
+
   async getProfile(userId: string) {
     return this.prisma.user.findUnique({
       where: { id: userId },
@@ -132,7 +157,7 @@ export class AuthService {
     const [accessToken, refreshToken] = await Promise.all([
       this.jwtService.signAsync(payload, {
         secret: this.config.get('JWT_SECRET'),
-        expiresIn: this.config.get('JWT_EXPIRES_IN', '15m'),
+        expiresIn: this.config.get('JWT_EXPIRES_IN', '24h'),
       }),
       this.jwtService.signAsync(payload, {
         secret: this.config.get('JWT_REFRESH_SECRET'),

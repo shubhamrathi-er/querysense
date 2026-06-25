@@ -40,9 +40,13 @@ apiClient.interceptors.response.use(
           `${API_URL}/api/v1/auth/refresh`,
           { refreshToken },
         );
-        const data = response.data as { data: { accessToken: string } };
-        const { accessToken } = data.data;
+        const data = response.data as {
+          data: { accessToken: string; refreshToken?: string };
+        };
+        const { accessToken, refreshToken: rotated } = data.data;
         localStorage.setItem('accessToken', accessToken);
+        // The endpoint rotates the refresh token — persist the new one.
+        if (rotated) localStorage.setItem('refreshToken', rotated);
         originalRequest.headers.Authorization = `Bearer ${accessToken}`;
         return apiClient(originalRequest);
       } catch {
