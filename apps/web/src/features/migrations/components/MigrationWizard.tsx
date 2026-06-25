@@ -2,15 +2,17 @@
 
 import { useMemo, useRef, useState } from 'react';
 import {
-  X, ArrowRight, ArrowLeft, Database, Loader2, Download, Copy, Check,
+  X, ArrowRight, ArrowLeft, ArrowDown, Database, Loader2, Download, Copy, Check,
   AlertTriangle, CheckCircle2, Play, FileCode, ShieldAlert, ShieldCheck, Info, ListOrdered,
+  Lock, Zap, Clock, Table2, Settings2, Search,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Select } from '@/components/ui/select';
 import { useConfirm } from '@/components/ui/confirm';
 import { useToast } from '@/components/ui/toast';
 import { useConnections } from '@/features/connections/hooks/useConnections';
-import type { DatabaseEngine } from '@/features/connections/types';
+import { engineLabel, type DatabaseEngine, type Connection } from '@/features/connections/types';
+import { EngineIcon } from './EngineIcon';
 import { useWorkspaceStore } from '@/stores/workspace.store';
 import {
   usePlanMigration,
@@ -28,6 +30,17 @@ interface Props {
 }
 
 type Step = 'select' | 'configure' | 'validate' | 'script' | 'run';
+
+// Shared column template so the header and every row align exactly:
+// checkbox · table name (flex) · source rows · target rows · status.
+const TABLE_GRID =
+  'grid grid-cols-[1.25rem_minmax(0,1fr)_5rem_5rem_5.5rem] items-center gap-3';
+
+const CONFLICT_DESC: Record<Conflict, string> = {
+  skip: 'Existing rows in the target with the same primary key will be skipped.',
+  upsert: 'Existing rows with the same primary key will be updated in place.',
+  truncate: 'All existing rows in the selected target tables are deleted before loading.',
+};
 
 const SEV_COLOR: Record<Severity, string> = {
   BLOCKER: 'text-red-600 dark:text-red-400',
@@ -77,6 +90,8 @@ export function MigrationWizard({ onClose }: Props) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [createTables, setCreateTables] = useState(true);
   const [conflict, setConflict] = useState<Conflict>('skip');
+  const [tableSearch, setTableSearch] = useState('');
+  const [tableFilter, setTableFilter] = useState<'all' | 'new' | 'existing'>('all');
 
   const [scriptResult, setScriptResult] = useState<ScriptResult | null>(null);
   const [copied, setCopied] = useState(false);
@@ -92,6 +107,16 @@ export function MigrationWizard({ onClose }: Props) {
     () => (planData?.order ?? []).filter((t) => selected.has(t)),
     [planData, selected],
   );
+
+  const planRows = (planData?.tables ?? []).reduce((s, t) => s + t.sourceRows, 0);
+  const planNew = (planData?.tables ?? []).filter((t) => !t.existsOnTarget).length;
+  const planExisting = (planData?.tables ?? []).filter((t) => t.existsOnTarget).length;
+  const visibleTables = (planData?.tables ?? []).filter((t) => {
+    if (tableFilter === 'new' && t.existsOnTarget) return false;
+    if (tableFilter === 'existing' && !t.existsOnTarget) return false;
+    if (tableSearch && !t.tableName.toLowerCase().includes(tableSearch.toLowerCase())) return false;
+    return true;
+  });
 
   const payload = (): RunPayload => ({
     sourceConnectionId: sourceId,
@@ -228,160 +253,277 @@ export function MigrationWizard({ onClose }: Props) {
     });
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
-      <div className="bg-card border border-border rounded-2xl w-full max-w-4xl max-h-[88vh] flex flex-col overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
+      <div className="flex max-h-[90vh] w-full max-w-[920px] flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl">
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-border">
-          <div className="flex items-center gap-2">
-            <Database className="w-5 h-5 text-primary" />
-            <h2 className="font-semibold">Migrate data</h2>
-            <span className="text-xs text-muted-foreground">
-              {(() => {
-                const e = sourceEngine ?? targetEngine;
-                const name =
-                  e === 'postgres' ? 'PostgreSQL'
-                  : e === 'sqlserver' ? 'SQL Server'
-                  : e === 'mariadb' ? 'MariaDB'
-                  : e === 'oracle' ? 'Oracle'
-                  : e === 'mysql' ? 'MySQL'
-                  : null;
-                return name ? `${name} → ${name}` : 'Same-engine copy';
-              })()}
-            </span>
+        <div className="border-b border-border px-6 py-4">
+          <div className="flex items-start justify-between">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-[#5B4FF7] to-[#7C6BFF] text-white shadow-md shadow-[#5B4FF7]/30">
+                <Database className="h-5 w-5" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <h2 className="text-base font-semibold text-foreground">Migrate data</h2>
+                  <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-semibold text-primary">
+                    Same-engine copy
+                  </span>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Copy tables and data from one connection to another.
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => {
+                cancelRef.current?.();
+                onClose();
+              }}
+              className="rounded-lg p-1.5 text-muted-foreground hover:bg-accent"
+            >
+              <X className="h-4 w-4" />
+            </button>
           </div>
-          <button
-            onClick={() => {
-              cancelRef.current?.();
-              onClose();
-            }}
-            className="p-1.5 rounded-lg hover:bg-accent text-muted-foreground"
-          >
-            <X className="w-4 h-4" />
-          </button>
+          <Stepper step={step} />
         </div>
 
         <div className="flex-1 overflow-y-auto p-6">
           {step === 'select' && (
-            <div className="space-y-4 max-w-lg">
-              <p className="text-sm text-muted-foreground">
-                Copy tables and data from one connection to another.
-              </p>
-              <ConnSelect label="Source" value={sourceId} onChange={selectSource} options={active} exclude={targetId} engineFilter={targetEngine} />
-              <div className="flex justify-center text-muted-foreground">
-                <ArrowRight className="w-4 h-4 rotate-90" />
+            <div className="space-y-5">
+              {/* Source */}
+              <ConnectionPicker
+                title="Source connection"
+                subtitle="Select the database you want to copy data from."
+                value={sourceId}
+                onChange={selectSource}
+                onClear={() => setSourceId('')}
+                options={active}
+                exclude={targetId}
+                engineFilter={targetEngine}
+              />
+
+              {/* Flow indicator */}
+              <div className="flex items-center gap-3">
+                <div className="h-px flex-1 bg-border" />
+                <div className="flex h-7 w-7 items-center justify-center rounded-full border border-primary/30 bg-primary/10 text-primary">
+                  <ArrowDown className="h-4 w-4" />
+                </div>
+                <div className="h-px flex-1 bg-border" />
               </div>
-              <ConnSelect label="Target" value={targetId} onChange={selectTarget} options={active} exclude={sourceId} engineFilter={sourceEngine} />
-              <p className="text-[11px] text-muted-foreground">
-                Source and target must use the same database engine — cross-engine
-                migration (MySQL ↔ PostgreSQL) isn&apos;t supported.
-              </p>
-              {plan.isError && (
-                <p className="text-xs text-destructive">
-                  {errMsg(plan.error)}
+
+              {/* Target */}
+              <ConnectionPicker
+                title="Target connection"
+                subtitle="Select the database you want to copy data to."
+                value={targetId}
+                onChange={selectTarget}
+                onClear={() => setTargetId('')}
+                options={active}
+                exclude={sourceId}
+                engineFilter={sourceEngine}
+              />
+
+              {/* Same-engine validation note */}
+              <div className="flex items-start gap-2.5 rounded-xl border border-primary/15 bg-primary/[0.05] px-4 py-3">
+                <Info className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                <p className="text-xs leading-relaxed text-foreground/80">
+                  <span className="font-medium text-foreground">Source and target must use the same database engine.</span>{' '}
+                  Cross-engine migration (e.g. MySQL → PostgreSQL) isn&apos;t supported.
                 </p>
-              )}
-              <div className="flex justify-end">
+              </div>
+
+              {/* Benefits at a glance */}
+              <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+                <Benefit icon={Lock} title="Secure & private" desc="Encrypted; never leaves your environment." />
+                <Benefit icon={Table2} title="Schema & data" desc="Tables, indexes and rows are migrated." />
+                <Benefit icon={Zap} title="Reliable & safe" desc="Runs with real-time progress." />
+                <Benefit icon={Clock} title="No downtime" desc="Existing databases stay unaffected." />
+              </div>
+
+              {/* Advanced options (configured on the next step) */}
+              <div className="flex items-center gap-3 rounded-xl border border-dashed border-border bg-muted/20 px-4 py-3">
+                <Settings2 className="h-4 w-4 shrink-0 text-muted-foreground" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-foreground">Advanced options</p>
+                  <p className="text-xs text-muted-foreground">
+                    Choose specific tables, conflict handling and create-table behaviour after preview.
+                  </p>
+                </div>
+                <span className="rounded-md bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">Next step</span>
+              </div>
+
+              {plan.isError && <p className="text-xs text-destructive">{errMsg(plan.error)}</p>}
+
+              {/* Footer */}
+              <div className="flex items-center justify-between border-t border-border pt-4">
+                <button
+                  onClick={() => { cancelRef.current?.(); onClose(); }}
+                  className="rounded-xl border border-border px-4 py-2.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent"
+                >
+                  Cancel
+                </button>
                 <button
                   onClick={handlePreview}
                   disabled={!sourceId || !targetId || sourceId === targetId || plan.isPending}
-                  className="flex items-center gap-1.5 text-sm px-4 py-2 rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+                  className="group inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-[#5B4FF7] to-[#7C6BFF] px-5 py-2.5 text-sm font-semibold text-white shadow-md shadow-[#5B4FF7]/30 transition-shadow hover:shadow-lg hover:shadow-[#5B4FF7]/40 disabled:opacity-40 disabled:shadow-none"
                 >
-                  {plan.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArrowRight className="w-4 h-4" />}
-                  Preview
+                  {plan.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  Preview migration
+                  <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
                 </button>
               </div>
             </div>
           )}
 
           {step === 'configure' && planData && (
-            <div className="space-y-4">
-              <div className="flex items-center gap-2 text-sm">
-                <span className="font-medium">{planData.source.name}</span>
-                <ArrowRight className="w-3.5 h-3.5 text-muted-foreground" />
-                <span className="font-medium">{planData.target.name}</span>
+            <div className="space-y-5">
+              {/* Summary at a glance */}
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <SummaryStat icon={Table2} tint="primary" value={planData.tables.length} label="Tables" sub="In the plan" />
+                <SummaryStat icon={FileCode} tint="sky" value={planRows.toLocaleString()} label="Total rows" sub="To be migrated" />
+                <SummaryStat icon={CheckCircle2} tint="emerald" value={planNew} label="New tables" sub="Created on target" />
+                <SummaryStat icon={Database} tint="violet" value={planExisting} label="Existing" sub="Already on target" />
               </div>
 
-              <div className="flex flex-wrap items-center gap-4 text-xs">
-                <label className="flex items-center gap-1.5 cursor-pointer">
-                  <input type="checkbox" checked={createTables} onChange={(e) => setCreateTables(e.target.checked)} className="accent-primary" />
-                  Create missing tables
-                </label>
-                <label className="flex items-center gap-1.5">
-                  On conflict:
-                  <Select
-                    value={conflict}
-                    onValueChange={(v) => setConflict(v as Conflict)}
-                    options={[
-                      { value: 'skip', label: 'Skip existing (by PK)' },
-                      { value: 'upsert', label: 'Upsert (update existing)' },
-                      { value: 'truncate', label: 'Truncate & load' },
-                    ]}
-                    ariaLabel="Conflict strategy"
-                    className="px-2 py-1 text-xs"
-                  />
-                </label>
-                {conflict === 'truncate' && (
-                  <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400">
-                    <ShieldAlert className="w-3.5 h-3.5" /> destroys target rows
-                  </span>
-                )}
-              </div>
-
-              {/* Table list */}
-              <div className="rounded-xl border border-border overflow-hidden">
-                <div className="grid grid-cols-[auto_1fr_auto_auto] gap-2 px-3 py-2 bg-muted/30 text-[10px] uppercase text-muted-foreground items-center">
-                  <input
-                    type="checkbox"
-                    checked={selected.size === planData.tables.length}
-                    onChange={(e) =>
-                      setSelected(e.target.checked ? new Set(planData.tables.map((t) => t.tableName)) : new Set())
-                    }
-                    className="accent-primary"
-                  />
-                  <span>Table</span>
-                  <span className="text-right">Source rows</span>
-                  <span className="text-right">Target</span>
+              {/* Source → Target overview */}
+              <div className="flex items-center gap-4 rounded-xl border border-border bg-card/60 p-4">
+                <Endpoint label="Source" engine={sourceEngine} name={planData.source.name} db={planData.source.database} />
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-primary/30 bg-primary/10 text-primary">
+                  <ArrowRight className="h-4 w-4" />
                 </div>
-                <div className="max-h-[40vh] overflow-y-auto">
-                  {planData.tables.map((t) => (
-                    <label
-                      key={t.tableName}
-                      className="grid grid-cols-[auto_1fr_auto_auto] gap-2 px-3 py-1.5 items-center border-t border-border/40 text-xs cursor-pointer hover:bg-accent/30"
-                    >
-                      <input type="checkbox" checked={selected.has(t.tableName)} onChange={() => toggle(t.tableName)} className="accent-primary" />
-                      <span className="font-mono truncate">{t.tableName}</span>
-                      <span className="text-right text-muted-foreground">{t.sourceRows.toLocaleString()}</span>
-                      <span className="text-right">
-                        {t.existsOnTarget ? (
-                          <span className="text-muted-foreground">{(t.targetRows ?? 0).toLocaleString()}</span>
-                        ) : (
-                          <span className="text-emerald-600 dark:text-emerald-400 text-[10px]">new</span>
+                <Endpoint label="Target" engine={targetEngine} name={planData.target.name} db={planData.target.database} align="right" />
+              </div>
+
+              {/* Migration options */}
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div className="flex items-start gap-3 rounded-xl border border-border bg-card/60 p-3.5">
+                  <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm font-medium text-foreground">Create missing tables</p>
+                      <button
+                        onClick={() => setCreateTables((v) => !v)}
+                        className={cn(
+                          'rounded-full px-2 py-0.5 text-[10px] font-semibold transition-colors',
+                          createTables ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' : 'bg-muted text-muted-foreground',
                         )}
-                      </span>
-                    </label>
-                  ))}
+                      >
+                        {createTables ? 'Enabled' : 'Disabled'}
+                      </button>
+                    </div>
+                    <p className="mt-0.5 text-xs text-muted-foreground">Tables that don’t exist on the target will be created.</p>
+                  </div>
+                </div>
+                <div className="flex items-start gap-3 rounded-xl border border-border bg-card/60 p-3.5">
+                  <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm font-medium text-foreground">On conflict</p>
+                      <Select
+                        value={conflict}
+                        onValueChange={(v) => setConflict(v as Conflict)}
+                        options={[
+                          { value: 'skip', label: 'Skip existing (by PK)' },
+                          { value: 'upsert', label: 'Upsert (update existing)' },
+                          { value: 'truncate', label: 'Truncate & load' },
+                        ]}
+                        ariaLabel="Conflict strategy"
+                        className="px-2 py-0.5 text-xs"
+                      />
+                    </div>
+                    <p className={cn('mt-0.5 text-xs', conflict === 'truncate' ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground')}>
+                      {CONFLICT_DESC[conflict]}
+                    </p>
+                  </div>
                 </div>
               </div>
 
-              <div className="flex items-center justify-between">
-                <button onClick={() => setStep('select')} className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-border hover:bg-accent text-muted-foreground">
-                  <ArrowLeft className="w-3.5 h-3.5" /> Back
+              {/* Objects table */}
+              <div className="rounded-xl border border-border overflow-hidden">
+                <div className="flex flex-wrap items-center gap-2 border-b border-border bg-muted/20 px-3 py-2.5">
+                  <div className="relative flex-1 min-w-[160px]">
+                    <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                    <input
+                      value={tableSearch}
+                      onChange={(e) => setTableSearch(e.target.value)}
+                      placeholder="Search tables…"
+                      className="w-full rounded-lg border border-border bg-background py-1.5 pl-8 pr-2 text-xs outline-none focus:border-primary/40"
+                    />
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <FilterTab active={tableFilter === 'all'} onClick={() => setTableFilter('all')}>All ({planData.tables.length})</FilterTab>
+                    <FilterTab active={tableFilter === 'new'} onClick={() => setTableFilter('new')}>New ({planNew})</FilterTab>
+                    <FilterTab active={tableFilter === 'existing'} onClick={() => setTableFilter('existing')}>Existing ({planExisting})</FilterTab>
+                  </div>
+                  <label className="ml-auto flex cursor-pointer items-center gap-1.5 text-xs font-medium text-muted-foreground">
+                    Select all
+                    <input
+                      type="checkbox"
+                      checked={selected.size === planData.tables.length && planData.tables.length > 0}
+                      onChange={(e) =>
+                        setSelected(e.target.checked ? new Set(planData.tables.map((t) => t.tableName)) : new Set())
+                      }
+                      className="accent-primary"
+                    />
+                  </label>
+                </div>
+
+                <div className={cn(TABLE_GRID, 'px-3 py-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground')}>
+                  <span />
+                  <span>Table name</span>
+                  <span className="text-right">Source rows</span>
+                  <span className="text-right">Target rows</span>
+                  <span className="text-center">Status</span>
+                </div>
+                <div className="max-h-[34vh] overflow-y-auto">
+                  {visibleTables.length === 0 ? (
+                    <p className="px-3 py-6 text-center text-xs text-muted-foreground">No tables match this filter.</p>
+                  ) : (
+                    visibleTables.map((t) => (
+                      <label
+                        key={t.tableName}
+                        className={cn(TABLE_GRID, 'cursor-pointer items-center border-t border-border/40 px-3 py-2 text-xs hover:bg-accent/30')}
+                      >
+                        <input type="checkbox" checked={selected.has(t.tableName)} onChange={() => toggle(t.tableName)} className="accent-primary" />
+                        <span className="flex min-w-0 items-center gap-2">
+                          <Table2 className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                          <span className="truncate font-mono text-foreground">{t.tableName}</span>
+                        </span>
+                        <span className="text-right tabular-nums text-muted-foreground">{t.sourceRows.toLocaleString()}</span>
+                        <span className="text-right tabular-nums text-muted-foreground">{t.existsOnTarget ? (t.targetRows ?? 0).toLocaleString() : '—'}</span>
+                        <span className="flex justify-center">
+                          {t.existsOnTarget ? (
+                            <span className="rounded-full bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium text-sky-600 dark:text-sky-400">Existing</span>
+                          ) : (
+                            <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">New</span>
+                          )}
+                        </span>
+                      </label>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              {/* Footer */}
+              <div className="flex items-center justify-between border-t border-border pt-4">
+                <button onClick={() => setStep('select')} className="flex items-center gap-1.5 rounded-xl border border-border px-4 py-2.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent">
+                  <ArrowLeft className="h-4 w-4" /> Back
                 </button>
                 <div className="flex items-center gap-2">
                   <button
                     onClick={handleGenerateScript}
                     disabled={orderedSelected.length === 0 || script.isPending}
-                    className="flex items-center gap-1.5 text-sm px-3.5 py-2 rounded-lg border border-border hover:bg-accent disabled:opacity-40"
+                    className="flex items-center gap-1.5 rounded-xl border border-border px-4 py-2.5 text-sm font-medium transition-colors hover:bg-accent disabled:opacity-40"
                   >
-                    {script.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileCode className="w-4 h-4" />}
+                    {script.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileCode className="h-4 w-4" />}
                     Generate script
                   </button>
                   <button
                     onClick={handleValidate}
                     disabled={orderedSelected.length === 0 || validate.isPending}
-                    className="flex items-center gap-1.5 text-sm px-3.5 py-2 rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+                    className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-[#5B4FF7] to-[#7C6BFF] px-5 py-2.5 text-sm font-semibold text-white shadow-md shadow-[#5B4FF7]/30 transition-shadow hover:shadow-lg hover:shadow-[#5B4FF7]/40 disabled:opacity-40 disabled:shadow-none"
                   >
-                    {validate.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <ShieldCheck className="w-4 h-4" />}
+                    {validate.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
                     Validate &amp; review
                   </button>
                 </div>
@@ -560,31 +702,200 @@ export function MigrationWizard({ onClose }: Props) {
   );
 }
 
-function ConnSelect({
-  label, value, onChange, options, exclude, engineFilter,
+const STEPPER = [
+  { label: 'Select connections', desc: 'Choose source & target' },
+  { label: 'Review plan', desc: 'Preview what will be copied' },
+  { label: 'Confirm & run', desc: 'Start migration' },
+];
+
+function Stepper({ step }: { step: Step }) {
+  // Select (0) → Review plan / configure (1) → Confirm & run / validate·script·run (2).
+  const current = step === 'select' ? 0 : step === 'configure' ? 1 : 2;
+  return (
+    <div className="mt-4 flex items-center">
+      {STEPPER.map((s, i) => {
+        const done = i < current;
+        const active = i === current;
+        return (
+          <div key={s.label} className="flex flex-1 items-center last:flex-none">
+            <div className="flex items-center gap-2.5">
+              <div
+                className={cn(
+                  'flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs font-semibold transition-colors',
+                  done && 'bg-gradient-to-br from-[#5B4FF7] to-[#7C6BFF] text-white',
+                  active && 'bg-primary/10 text-primary ring-1 ring-inset ring-primary/30',
+                  !done && !active && 'bg-muted text-muted-foreground',
+                )}
+              >
+                {done ? <Check className="h-3.5 w-3.5" /> : i + 1}
+              </div>
+              <div className="hidden sm:block">
+                <p className={cn('text-xs font-semibold leading-tight', active || done ? 'text-foreground' : 'text-muted-foreground')}>
+                  {s.label}
+                </p>
+                <p className="text-[10px] leading-tight text-muted-foreground">{s.desc}</p>
+              </div>
+            </div>
+            {i < STEPPER.length - 1 && (
+              <div className={cn('mx-3 h-px flex-1', done ? 'bg-primary/40' : 'bg-border')} />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function Benefit({ icon: Icon, title, desc }: { icon: typeof Lock; title: string; desc: string }) {
+  return (
+    <div className="rounded-xl border border-border bg-card/60 p-3">
+      <Icon className="h-4 w-4 text-primary" />
+      <p className="mt-2 text-xs font-semibold text-foreground">{title}</p>
+      <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">{desc}</p>
+    </div>
+  );
+}
+
+const STAT_TINT: Record<string, string> = {
+  primary: 'bg-primary/10 text-primary',
+  sky: 'bg-sky-500/10 text-sky-600 dark:text-sky-400',
+  emerald: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+  violet: 'bg-violet-500/10 text-violet-600 dark:text-violet-400',
+};
+
+function SummaryStat({
+  icon: Icon, tint, value, label, sub,
+}: {
+  icon: typeof Table2;
+  tint: keyof typeof STAT_TINT;
+  value: string | number;
+  label: string;
+  sub: string;
+}) {
+  return (
+    <div className="rounded-xl border border-border bg-card/60 p-3.5">
+      <div className={cn('flex h-9 w-9 items-center justify-center rounded-lg', STAT_TINT[tint])}>
+        <Icon className="h-5 w-5" />
+      </div>
+      <p className="mt-2.5 text-xl font-bold tracking-tight text-foreground">{value}</p>
+      <p className="text-xs font-medium text-foreground">{label}</p>
+      <p className="text-[11px] text-muted-foreground">{sub}</p>
+    </div>
+  );
+}
+
+function Endpoint({
+  label, engine, name, db, align = 'left',
 }: {
   label: string;
+  engine?: DatabaseEngine;
+  name: string;
+  db: string;
+  align?: 'left' | 'right';
+}) {
+  const right = align === 'right';
+  return (
+    <div className={cn('flex min-w-0 flex-1 items-center gap-3', right && 'flex-row-reverse text-right')}>
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-border bg-background">
+        <EngineIcon engine={engine} className="h-5 w-5" />
+      </div>
+      <div className="min-w-0">
+        <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">{label}</p>
+        <p className="truncate text-sm font-semibold text-foreground">{name}</p>
+        <p className="truncate text-xs text-muted-foreground">{engineLabel(engine)} · {db}</p>
+      </div>
+    </div>
+  );
+}
+
+function FilterTab({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        'rounded-lg px-2.5 py-1 text-xs font-medium transition-colors',
+        active ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:bg-accent',
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+const STATUS_TONE: Record<Connection['status'], string> = {
+  ACTIVE: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+  PENDING: 'bg-amber-500/10 text-amber-600 dark:text-amber-400',
+  ERROR: 'bg-red-500/10 text-red-600 dark:text-red-400',
+  DISCONNECTED: 'bg-muted text-muted-foreground',
+};
+
+function ConnectionPicker({
+  title, subtitle, value, onChange, onClear, options, exclude, engineFilter,
+}: {
+  title: string;
+  subtitle: string;
   value: string;
   onChange: (v: string) => void;
-  options: Array<{ id: string; name: string; databaseName: string; engine: DatabaseEngine }>;
+  onClear: () => void;
+  options: Connection[];
   exclude: string;
   engineFilter?: DatabaseEngine;
 }) {
+  const choices = options
+    .filter((o) => o.id !== exclude)
+    .filter((o) => !engineFilter || o.engine === engineFilter);
+  const selected = options.find((o) => o.id === value);
+
   return (
-    <label className="block space-y-1">
-      <span className="text-xs font-medium text-muted-foreground">{label}</span>
-      <Select
-        value={value}
-        onValueChange={onChange}
-        placeholder="Select a connection…"
-        options={options
-          .filter((o) => o.id !== exclude)
-          .filter((o) => !engineFilter || o.engine === engineFilter)
-          .map((o) => ({ value: o.id, label: `${o.name} (${o.databaseName})` }))}
-        ariaLabel={label}
-        className="w-full"
-      />
-    </label>
+    <div>
+      <p className="text-sm font-semibold text-foreground">{title}</p>
+      <p className="mb-2 text-xs text-muted-foreground">{subtitle}</p>
+
+      {selected ? (
+        <div className="rounded-xl border border-border bg-card p-4 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
+          <div className="flex items-center gap-3">
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-border bg-background">
+              <EngineIcon engine={selected.engine} className="h-6 w-6" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-semibold text-foreground">{selected.name}</p>
+              <p className="truncate text-xs text-muted-foreground">
+                {engineLabel(selected.engine)} · {selected.databaseName} · {selected.host}
+              </p>
+            </div>
+            <button
+              onClick={onClear}
+              className="rounded-lg px-2.5 py-1 text-xs font-medium text-primary transition-colors hover:bg-primary/10"
+            >
+              Change
+            </button>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 border-t border-border/60 pt-3 text-xs">
+            <span className="flex items-center gap-1.5 text-muted-foreground">
+              <Table2 className="h-3.5 w-3.5" />
+              <span className="font-medium text-foreground">{selected._count?.schemaMetadata ?? 0}</span> tables
+            </span>
+            <span className="flex items-center gap-1.5 text-muted-foreground">
+              <Database className="h-3.5 w-3.5" />
+              <span className="font-medium text-foreground">{engineLabel(selected.engine)}</span>
+            </span>
+            <span className={cn('ml-auto inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-medium', STATUS_TONE[selected.status])}>
+              <span className="h-1.5 w-1.5 rounded-full bg-current opacity-70" />
+              {selected.status.charAt(0) + selected.status.slice(1).toLowerCase()}
+            </span>
+          </div>
+        </div>
+      ) : (
+        <Select
+          value={value}
+          onValueChange={onChange}
+          placeholder={choices.length ? 'Select a connection…' : 'No eligible connections'}
+          options={choices.map((o) => ({ value: o.id, label: `${o.name} · ${o.databaseName}` }))}
+          ariaLabel={title}
+          className="w-full"
+        />
+      )}
+    </div>
   );
 }
 
