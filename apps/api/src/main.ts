@@ -1,6 +1,11 @@
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
-import { ValidationPipe, Logger } from '@nestjs/common';
+import {
+  ValidationPipe,
+  Logger,
+  BadRequestException,
+  type ValidationError,
+} from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import helmet from 'helmet';
 import compression from 'compression';
@@ -38,12 +43,27 @@ async function bootstrap() {
     allowedHeaders: ['Content-Type', 'Authorization'],
   });
 
+  const validationLogger = new Logger('Validation');
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
       forbidNonWhitelisted: true,
       transform: true,
       transformOptions: { enableImplicitConversion: true },
+      // Log the specific failures server-side for monitoring, but return a
+      // generic message to the client so we never reveal which field failed.
+      exceptionFactory: (errors: ValidationError[]) => {
+        const details = errors
+          .map(
+            (e) =>
+              `${e.property}: ${Object.values(e.constraints ?? {}).join(', ')}`,
+          )
+          .join('; ');
+        validationLogger.warn(`Validation failed — ${details}`);
+        return new BadRequestException(
+          'Invalid input. Please check your details and try again.',
+        );
+      },
     }),
   );
 
