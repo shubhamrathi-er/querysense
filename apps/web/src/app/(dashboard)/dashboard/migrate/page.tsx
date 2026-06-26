@@ -1,15 +1,14 @@
 'use client';
 
-import { useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { motion } from 'framer-motion';
 import {
   ArrowRightLeft, ArrowRight, ChevronRight, Plus, Lock, ShieldCheck,
-  Database, DatabaseZap, Eye, ListChecks, Play, Sparkles,
+  Database, DatabaseZap, Eye, ListChecks, Play, Sparkles, History,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useConnections } from '@/features/connections/hooks/useConnections';
-import { MigrationWizard } from '@/features/migrations/components/MigrationWizard';
 
 const CARD =
   'rounded-[22px] border border-border bg-card/80 backdrop-blur-xl ' +
@@ -22,7 +21,7 @@ const fadeUp = {
 
 export default function MigrateDataPage() {
   const { data: connections, isLoading } = useConnections();
-  const [showWizard, setShowWizard] = useState(false);
+  const router = useRouter();
 
   const active = (connections ?? []).filter((c) => c.status === 'ACTIVE');
   const canMigrate = active.length >= 2;
@@ -89,7 +88,7 @@ export default function MigrateDataPage() {
           <div className="mt-5 flex flex-col items-center">
             {canMigrate ? (
               <motion.button
-                onClick={() => setShowWizard(true)}
+                onClick={() => router.push('/dashboard/migrate/new')}
                 whileHover={{ scale: 1.025 }}
                 whileTap={{ scale: 0.98 }}
                 className="group inline-flex items-center gap-2.5 rounded-xl bg-gradient-to-r from-[#5B4FF7] to-[#7C6BFF] px-6 py-3 text-sm font-semibold text-white shadow-lg shadow-[#5B4FF7]/30 transition-shadow hover:shadow-xl hover:shadow-[#5B4FF7]/40"
@@ -106,7 +105,13 @@ export default function MigrateDataPage() {
                 <Plus className="h-4 w-4" /> Add a connection
               </Link>
             )}
-            <p className="mt-3 flex items-center gap-1.5 text-xs text-muted-foreground">
+            <Link
+              href="/dashboard/migrate/history"
+              className="mt-3 inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground"
+            >
+              <History className="h-3.5 w-3.5" /> View migration history
+            </Link>
+            <p className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
               <Lock className="h-3.5 w-3.5 text-emerald-500" />
               Encrypted — your data never leaves your environment.
             </p>
@@ -116,8 +121,6 @@ export default function MigrateDataPage() {
         {/* ── How it works ── */}
         <MigrationSteps />
       </motion.div>
-
-      {showWizard && <MigrationWizard onClose={() => setShowWizard(false)} />}
     </div>
   );
 }

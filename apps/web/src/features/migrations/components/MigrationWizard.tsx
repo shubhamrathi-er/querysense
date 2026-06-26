@@ -13,8 +13,8 @@ import { useToast } from '@/components/ui/toast';
 import { useConnections } from '@/features/connections/hooks/useConnections';
 import { engineLabel, type DatabaseEngine, type Connection } from '@/features/connections/types';
 import { EngineIcon } from './EngineIcon';
+import Link from 'next/link';
 import { SchemaDiff } from './SchemaDiff';
-import { MigrationHistory } from './MigrationHistory';
 import { useWorkspaceStore } from '@/stores/workspace.store';
 import {
   usePlanMigration,
@@ -112,7 +112,6 @@ export function MigrationWizard({ onClose }: Props) {
   const [previewTable, setPreviewTable] = useState<string | null>(null);
   const [previewData, setPreviewData] = useState<PreviewResult | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
-  const [showHistory, setShowHistory] = useState(false);
   // AI assistant (validate step)
   const [assistQ, setAssistQ] = useState('');
   const [assistAnswer, setAssistAnswer] = useState('');
@@ -415,8 +414,7 @@ export function MigrationWizard({ onClose }: Props) {
 
   return (
     <>
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
-      <div className="flex max-h-[90vh] w-full max-w-[920px] flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl">
+    <div className="flex h-full flex-col overflow-hidden bg-background">
         {/* Header */}
         <div className="border-b border-border px-6 py-4">
           <div className="flex items-start justify-between">
@@ -437,18 +435,19 @@ export function MigrationWizard({ onClose }: Props) {
               </div>
             </div>
             <div className="flex items-center gap-1">
-              <button
-                onClick={() => setShowHistory(true)}
+              <Link
+                href="/dashboard/migrate/history"
                 className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-muted-foreground hover:bg-accent"
               >
                 <History className="h-4 w-4" /> History
-              </button>
+              </Link>
               <button
                 onClick={() => {
                   cancelRef.current?.();
                   onClose();
                 }}
                 className="rounded-lg p-1.5 text-muted-foreground hover:bg-accent"
+                aria-label="Close"
               >
                 <X className="h-4 w-4" />
               </button>
@@ -986,7 +985,6 @@ export function MigrationWizard({ onClose }: Props) {
             </div>
           )}
         </div>
-      </div>
     </div>
     {previewTable && (
       <PreviewModal
@@ -996,7 +994,6 @@ export function MigrationWizard({ onClose }: Props) {
         onClose={() => setPreviewTable(null)}
       />
     )}
-    {showHistory && <MigrationHistory onClose={() => setShowHistory(false)} />}
     </>
   );
 }
@@ -1141,11 +1138,11 @@ function PreviewModal({
   };
   return (
     <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm"
+      className="fixed inset-0 z-[60] flex justify-end bg-black/40 backdrop-blur-sm"
       onClick={onClose}
     >
       <div
-        className="flex max-h-[80vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-border bg-background shadow-xl"
+        className="flex h-full w-full max-w-2xl flex-col overflow-hidden border-l border-border bg-background shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-border px-4 py-3">
