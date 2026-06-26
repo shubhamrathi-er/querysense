@@ -28,7 +28,7 @@ export default function MigrateDataPage() {
   const canMigrate = active.length >= 2;
 
   return (
-    <div className="relative flex h-full flex-col overflow-hidden">
+    <div className="flex flex-col relative">
       {/* Local accent glows over the shared dashboard backdrop */}
       <div aria-hidden className="pointer-events-none absolute inset-0 -z-0 overflow-hidden">
         <div className="absolute -left-24 top-6 h-64 w-64 rounded-full bg-[#7C6BFF]/10 blur-[100px]" />
@@ -227,7 +227,7 @@ function MigrationSteps() {
       </h3>
       <div className="my-3 h-px bg-gradient-to-r from-primary/40 via-primary/15 to-transparent" />
       <div className="grid grid-cols-2 gap-2.5 lg:grid-cols-4">
-        {STEPS.map((s, i) => (
+        {STEPS.map((s) => (
           <motion.div
             key={s.title}
             whileHover={{ y: -3 }}
@@ -237,12 +237,12 @@ function MigrationSteps() {
               <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
                 <s.icon className="h-5 w-5" />
               </div>
-              <span className="flex h-5 w-5 items-center justify-center rounded-full bg-gradient-to-br from-[#5B4FF7] to-[#7C6BFF] text-[10px] font-bold text-white shadow-sm">
-                {i + 1}
-              </span>
+              <div>
+                <p className="text-sm font-semibold text-foreground">{s.title}</p>
+                <p className="text-xs leading-snug text-muted-foreground">{s.desc}</p>
+              </div>
             </div>
-            <p className="mt-2.5 text-sm font-semibold text-foreground">{s.title}</p>
-            <p className="mt-0.5 text-xs leading-snug text-muted-foreground">{s.desc}</p>
+
           </motion.div>
         ))}
       </div>
