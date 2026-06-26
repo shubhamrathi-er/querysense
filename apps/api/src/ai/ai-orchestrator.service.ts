@@ -444,6 +444,45 @@ export class AiOrchestratorService {
     );
   }
 
+  /**
+   * Free-form migration assistant: answer a user's question using the supplied
+   * migration context (plan/validation summary). Returns plain text.
+   */
+  async migrationAssist(question: string, context: string): Promise<string> {
+    const messages: ChatMessage[] = [
+      {
+        role: 'system',
+        content:
+          'You are a database migration assistant inside a same-engine data-migration tool ' +
+          '(table/column mapping, row filters, transforms, incremental copy, create/rollback). ' +
+          'Answer the user using the provided migration context. Be concise, concrete, and practical; ' +
+          'prefer short paragraphs or bullet points. If the context is insufficient, say what else you need.',
+      },
+      {
+        role: 'user',
+        content: `${context ? `Migration context:\n${context}\n\n` : ''}Question: ${question}`,
+      },
+    ];
+
+    const providers = [this.groq, this.openRouter, this.gemini];
+    for (const provider of providers) {
+      if (!this.hasApiKey(provider.name)) continue;
+      try {
+        const result = await provider.complete(messages);
+        const text = result.content.trim();
+        if (text) return text;
+      } catch (error) {
+        this.logger.warn(
+          `Migration assist via ${provider.name} failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+        );
+        continue;
+      }
+    }
+    throw new ServiceUnavailableException(
+      'The AI assistant is unavailable right now. All providers failed or are not configured.',
+    );
+  }
+
   private parseColumnMapping(
     content: string,
     validSources: Set<string>,

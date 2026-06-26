@@ -214,6 +214,10 @@ export class MysqlMigrationDriver implements MigrationDriver {
     await this.tConn.query(`TRUNCATE TABLE ${id(table)}`);
   }
 
+  async dropTargetTable(table: string): Promise<void> {
+    await this.tConn.query(`DROP TABLE IF EXISTS ${id(table)}`);
+  }
+
   /** Render a scalar as a MySQL literal for an inlined WHERE predicate. */
   private literalValue(v: unknown): string {
     if (v === null || v === undefined) return 'NULL';

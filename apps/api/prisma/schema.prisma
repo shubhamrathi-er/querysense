@@ -408,3 +408,26 @@ enum ChunkType {
   RELATIONSHIPS
   GLOSSARY
 }
+
+// Data-migration run history (powers history, resume, retry, rollback).
+// Relation-less by design (mirrors an audit log) so it can be added additively.
+model MigrationRun {
+  id                 String    @id @default(cuid())
+  workspaceId        String
+  sourceConnectionId String
+  targetConnectionId String
+  status             String    @default("running") // running | completed | partial | failed | cancelled
+  conflict           String
+  createTables       Boolean   @default(true)
+  tables             Json // ordered list of selected source tables
+  config             Json // full run options snapshot (mappings/filters/transforms) for resume & retry
+  report             Json? // per-table results [{ table, copied, sourceRows, targetRows, status, error }]
+  totalCopied        Int       @default(0)
+  error              String?   @db.Text
+  startedAt          DateTime  @default(now())
+  finishedAt         DateTime?
+
+  @@index([workspaceId])
+  @@index([workspaceId, startedAt])
+  @@map("migration_runs")
+}

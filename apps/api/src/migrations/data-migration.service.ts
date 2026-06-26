@@ -299,8 +299,13 @@ export class DataMigrationService {
     }
 
     let driver: MigrationDriver | null = null;
+    // Record this run for history/resume/retry (best-effort — never blocks the copy).
+    const runId = await this.createRunRecord(workspaceId, dto).catch(() => null);
+    if (runId) send('run', { runId });
     const report: Array<{
       table: string;
+      target?: string;
+      created?: boolean;
       copied: number;
       sourceRows: number;
       targetRows: number;
@@ -339,10 +344,12 @@ export class DataMigrationService {
         const target = targetOf(table);
         this.assertIdent(target);
         send('table', { table, status: 'start' });
+        let created = false;
         try {
           if (!targetExisting.has(target)) {
             if (dto.createTables) {
               await driver.createTableOnTarget(table, target);
+              created = true;
               send('table', { table, status: 'created' });
             }
           } else {
@@ -380,25 +387,256 @@ export class DataMigrationService {
 
           const sourceRows = await driver.sourceCount(table);
           const targetRows = await driver.targetCount(target);
-          report.push({ table, copied, sourceRows, targetRows, status: 'done' });
+          report.push({ table, target, created, copied, sourceRows, targetRows, status: 'done' });
           send('table', { table, status: 'done', copied, sourceRows, targetRows, target });
         } catch (err) {
           const msg = err instanceof Error ? err.message : 'copy failed';
-          report.push({ table, copied: 0, sourceRows: 0, targetRows: 0, status: 'error', error: msg });
+          report.push({ table, target, created, copied: 0, sourceRows: 0, targetRows: 0, status: 'error', error: msg });
           send('table', { table, status: 'error', error: msg });
         }
       }
 
-      send('done', { report });
+      await this.finishRunRecord(runId, report, null).catch(() => {});
+      send('done', { report, runId });
       res.end();
     } catch (err) {
-      send('error', {
-        message: err instanceof Error ? err.message : 'Migration failed',
-      });
+      const message = err instanceof Error ? err.message : 'Migration failed';
+      await this.finishRunRecord(runId, report, message).catch(() => {});
+      send('error', { message });
       res.end();
     } finally {
       if (driver) await driver.close();
     }
+  }
+
+  // ─── Run history persistence (best-effort) ───────────────
+
+  private async createRunRecord(
+    workspaceId: string,
+    dto: {
+      sourceConnectionId: string;
+      targetConnectionId: string;
+      tables: string[];
+      createTables: boolean;
+      conflict: Conflict;
+      [key: string]: unknown;
+    },
+  ): Promise<string> {
+    const config = {
+      skipValidation: dto.skipValidation,
+      createMissingColumns: dto.createMissingColumns,
+      tableMappings: dto.tableMappings,
+      columnMappings: dto.columnMappings,
+      addColumns: dto.addColumns,
+      rowFilters: dto.rowFilters,
+      incremental: dto.incremental,
+      transforms: dto.transforms,
+    };
+    const rec = await this.prisma.migrationRun.create({
+      data: {
+        workspaceId,
+        sourceConnectionId: dto.sourceConnectionId,
+        targetConnectionId: dto.targetConnectionId,
+        status: 'running',
+        conflict: dto.conflict,
+        createTables: dto.createTables ?? true,
+        tables: dto.tables as unknown as object,
+        config: config as unknown as object,
+      },
+      select: { id: true },
+    });
+    return rec.id;
+  }
+
+  /** Finalize a run record. `fatalError` set → failed; else derive from the report. */
+  private async finishRunRecord(
+    runId: string | null,
+    report: Array<{ status: string; copied: number }>,
+    fatalError: string | null,
+  ): Promise<void> {
+    if (!runId) return;
+    const totalCopied = report.reduce((s, r) => s + (r.copied || 0), 0);
+    const errored = report.filter((r) => r.status === 'error').length;
+    const status = fatalError
+      ? 'failed'
+      : errored === 0
+        ? 'completed'
+        : errored === report.length
+          ? 'failed'
+          : 'partial';
+    await this.prisma.migrationRun.update({
+      where: { id: runId },
+      data: {
+        status,
+        report: report as unknown as object,
+        totalCopied,
+        error: fatalError,
+        finishedAt: new Date(),
+      },
+    });
+  }
+
+  // ─── AI assistant ────────────────────────────────────────
+
+  async assist(question: string, context?: string): Promise<{ answer: string }> {
+    const answer = await this.ai.migrationAssist(question, context ?? '');
+    return { answer };
+  }
+
+  // ─── Rollback ────────────────────────────────────────────
+
+  /**
+   * Roll back a run by DROPping only the target tables this run CREATED — that
+   * fully and safely undoes them. Tables that pre-existed (data appended) are
+   * skipped, since deleting their rows can't be done without risking prior data.
+   */
+  async rollbackRun(
+    workspaceId: string,
+    id: string,
+  ): Promise<{ dropped: string[]; skipped: string[] }> {
+    const run = await this.getRun(workspaceId, id);
+    const report = (Array.isArray(run.report) ? run.report : []) as Array<{
+      table: string;
+      target?: string;
+      created?: boolean;
+    }>;
+    const toDrop = report.filter((r) => r.created);
+    const skipped = report.filter((r) => !r.created).map((r) => r.table);
+    if (toDrop.length === 0) return { dropped: [], skipped };
+
+    const source = await this.load(run.sourceConnectionId, workspaceId);
+    const target = await this.load(run.targetConnectionId, workspaceId);
+    const engine = this.assertSameEngine(source, target);
+    const driver = createMigrationDriver(engine, this.connOf(source), this.connOf(target));
+    await driver.openTarget();
+    const dropped: string[] = [];
+    try {
+      for (const r of toDrop) {
+        const t = r.target || r.table;
+        this.assertIdent(t);
+        await driver.dropTargetTable(t);
+        dropped.push(t);
+      }
+    } finally {
+      await driver.close();
+    }
+    await this.prisma.migrationRun
+      .update({ where: { id }, data: { status: 'cancelled' } })
+      .catch(() => {});
+    return { dropped, skipped };
+  }
+
+  // ─── History queries ─────────────────────────────────────
+
+  async listRuns(workspaceId: string, limit = 50) {
+    return this.prisma.migrationRun.findMany({
+      where: { workspaceId },
+      orderBy: { startedAt: 'desc' },
+      take: Math.min(Math.max(limit, 1), 200),
+      select: {
+        id: true,
+        sourceConnectionId: true,
+        targetConnectionId: true,
+        status: true,
+        conflict: true,
+        tables: true,
+        totalCopied: true,
+        error: true,
+        startedAt: true,
+        finishedAt: true,
+      },
+    });
+  }
+
+  async getRun(workspaceId: string, id: string) {
+    const run = await this.prisma.migrationRun.findFirst({
+      where: { id, workspaceId },
+    });
+    if (!run) throw new NotFoundException('Migration run not found.');
+    return run;
+  }
+
+  /**
+   * Post-migration integrity report for a stored run: row-count + checksum
+   * verification (mapping-aware), plus which tables had filters/incremental so
+   * the UI can explain expected count differences.
+   */
+  async integrityForRun(workspaceId: string, id: string) {
+    const run = await this.getRun(workspaceId, id);
+    const tables = (Array.isArray(run.tables) ? run.tables : []) as string[];
+    const cfg = (run.config && typeof run.config === 'object' ? run.config : {}) as Record<
+      string,
+      unknown
+    >;
+    const report = await this.validation.verify(workspaceId, {
+      sourceConnectionId: run.sourceConnectionId,
+      targetConnectionId: run.targetConnectionId,
+      tables,
+      tableMappings: cfg.tableMappings as never,
+    });
+    const filtered = new Set<string>([
+      ...((cfg.rowFilters as Array<{ table: string }>) ?? []).map((f) => f.table),
+      ...((cfg.incremental as Array<{ table: string }>) ?? []).map((i) => i.table),
+    ]);
+    return { ...report, filteredTables: [...filtered] };
+  }
+
+  /**
+   * Reconstruct a run dto from a stored record for resume/retry. Never throws —
+   * returns ok:false so the streaming controller can emit a clean SSE error.
+   *  - retry: re-run only tables that errored.
+   *  - resume: re-run tables that didn't complete (errored or never reached).
+   */
+  async prepareRerun(
+    workspaceId: string,
+    id: string,
+    mode: 'resume' | 'retry',
+  ): Promise<
+    | { ok: true; dto: Parameters<DataMigrationService['run']>[1] }
+    | { ok: false; message: string }
+  > {
+    const prev = await this.prisma.migrationRun.findFirst({ where: { id, workspaceId } });
+    if (!prev) return { ok: false, message: 'Migration run not found.' };
+
+    const report = (Array.isArray(prev.report) ? prev.report : []) as Array<{
+      table: string;
+      status: string;
+    }>;
+    const allTables = (Array.isArray(prev.tables) ? prev.tables : []) as string[];
+    const done = new Set(report.filter((r) => r.status !== 'error').map((r) => r.table));
+    const errored = report.filter((r) => r.status === 'error').map((r) => r.table);
+    const subset = mode === 'retry' ? errored : allTables.filter((t) => !done.has(t));
+
+    if (subset.length === 0) {
+      return {
+        ok: false,
+        message:
+          mode === 'retry'
+            ? 'No failed tables to retry.'
+            : 'Nothing to resume — every table already completed.',
+      };
+    }
+
+    const cfg = (prev.config && typeof prev.config === 'object' ? prev.config : {}) as Record<
+      string,
+      unknown
+    >;
+    const dto = {
+      sourceConnectionId: prev.sourceConnectionId,
+      targetConnectionId: prev.targetConnectionId,
+      tables: subset,
+      createTables: prev.createTables,
+      conflict: prev.conflict as Conflict,
+      skipValidation: cfg.skipValidation as boolean | undefined,
+      createMissingColumns: cfg.createMissingColumns as boolean | undefined,
+      tableMappings: cfg.tableMappings as never,
+      columnMappings: cfg.columnMappings as never,
+      addColumns: cfg.addColumns as never,
+      rowFilters: cfg.rowFilters as never,
+      incremental: cfg.incremental as never,
+      transforms: cfg.transforms as never,
+    };
+    return { ok: true, dto };
   }
 
   // ─── Orchestration helpers (engine-agnostic) ─────────────

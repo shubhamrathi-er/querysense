@@ -264,6 +264,12 @@ export class SqlServerMigrationDriver implements MigrationDriver {
     await this.tClient.query(`DELETE FROM ${tbl(table)}`);
   }
 
+  async dropTargetTable(table: string): Promise<void> {
+    await this.tClient.query(
+      `IF OBJECT_ID('${SCHEMA}.${table}', 'U') IS NOT NULL DROP TABLE ${tbl(table)}`,
+    );
+  }
+
   /** Build the per-batch write statement for the conflict mode. */
   private writeStatement(
     table: string,

@@ -302,6 +302,10 @@ export class PostgresMigrationDriver implements MigrationDriver {
       .map((c) => `ALTER TABLE ${id(targetTable)} ADD COLUMN IF NOT EXISTS ${this.addColumnDef(c)};`);
   }
 
+  async dropTargetTable(table: string): Promise<void> {
+    await this.tClient.query(`DROP TABLE IF EXISTS ${id(table)} CASCADE`);
+  }
+
   async truncateTarget(table: string): Promise<void> {
     // DELETE (not TRUNCATE) so FK-trigger suppression via session_replication_role
     // applies and we don't risk a CASCADE into non-selected tables.

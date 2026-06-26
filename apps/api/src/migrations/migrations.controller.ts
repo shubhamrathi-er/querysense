@@ -1,8 +1,10 @@
 import {
   Controller,
   Post,
+  Get,
   Body,
   Param,
+  Query,
   UseGuards,
   Res,
 } from '@nestjs/common';
@@ -16,6 +18,8 @@ import {
   ValidateMigrationDto,
   SuggestColumnsDto,
   PreviewTableDto,
+  RerunDto,
+  AssistDto,
 } from './dto/migration.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { WorkspaceMemberGuard } from '../workspaces/guards/workspace-member.guard';
@@ -51,6 +55,71 @@ export class MigrationsController {
       tables: dto.tables,
       tableMappings: dto.tableMappings,
     });
+  }
+
+  @Get('history')
+  @ApiOperation({ summary: 'List past migration runs for the workspace' })
+  history(
+    @Param('workspaceId') workspaceId: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.migrationService.listRuns(workspaceId, limit ? Number(limit) : 50);
+  }
+
+  @Get('history/:id')
+  @ApiOperation({ summary: 'Get a single migration run (full detail)' })
+  historyDetail(
+    @Param('workspaceId') workspaceId: string,
+    @Param('id') id: string,
+  ) {
+    return this.migrationService.getRun(workspaceId, id);
+  }
+
+  @Get('history/:id/integrity')
+  @ApiOperation({ summary: 'Post-migration integrity report for a run (counts + checksums)' })
+  integrity(
+    @Param('workspaceId') workspaceId: string,
+    @Param('id') id: string,
+  ) {
+    return this.migrationService.integrityForRun(workspaceId, id);
+  }
+
+  @Post('history/:id/rollback')
+  @ApiOperation({ summary: 'Roll back a run by dropping the tables it created' })
+  rollback(
+    @Param('workspaceId') workspaceId: string,
+    @Param('id') id: string,
+  ) {
+    return this.migrationService.rollbackRun(workspaceId, id);
+  }
+
+  @Post('assistant')
+  @ApiOperation({ summary: 'Ask the AI migration assistant' })
+  assistant(
+    @Param('workspaceId') _workspaceId: string,
+    @Body() dto: AssistDto,
+  ) {
+    return this.migrationService.assist(dto.question, dto.context);
+  }
+
+  @Post('history/:id/rerun')
+  @ApiOperation({ summary: 'Resume or retry a past migration run (SSE progress)' })
+  async rerun(
+    @Param('workspaceId') workspaceId: string,
+    @Param('id') id: string,
+    @Body() dto: RerunDto,
+    @Res() res: express.Response,
+  ): Promise<void> {
+    const prep = await this.migrationService.prepareRerun(workspaceId, id, dto.mode);
+    if (!prep.ok) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.flushHeaders();
+      res.write(`event: error\ndata: ${JSON.stringify({ message: prep.message })}\n\n`);
+      res.end();
+      return;
+    }
+    await this.migrationService.run(workspaceId, prep.dto, res);
   }
 
   @Post('preview')

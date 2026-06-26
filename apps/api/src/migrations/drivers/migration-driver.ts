@@ -135,6 +135,8 @@ export interface MigrationDriver {
   // source `table`; writes use `targetTable`.
   createTableOnTarget(table: string, targetTable?: string): Promise<void>;
   truncateTarget(table: string): Promise<void>;
+  /** DROP a target table (used by rollback of tables this tool created). */
+  dropTargetTable(table: string): Promise<void>;
 
   // ── add missing columns to an existing target table (ALTER ADD COLUMN) ──
   // Adds source columns (nullable) to `targetTable` if absent. When `columns`

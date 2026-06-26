@@ -24,6 +24,25 @@ export class TableMappingDto {
   target!: string;
 }
 
+/** Ask the AI migration assistant a question with optional context. */
+export class AssistDto {
+  @ApiProperty()
+  @IsString()
+  question!: string;
+
+  @ApiProperty({ required: false, description: 'Migration context (plan/validation summary)' })
+  @IsOptional()
+  @IsString()
+  context?: string;
+}
+
+/** Resume or retry a past migration run. */
+export class RerunDto {
+  @ApiProperty({ enum: ['resume', 'retry'] })
+  @IsIn(['resume', 'retry'])
+  mode!: 'resume' | 'retry';
+}
+
 /** Read-only data preview for one source table. */
 export class PreviewTableDto {
   @ApiProperty()

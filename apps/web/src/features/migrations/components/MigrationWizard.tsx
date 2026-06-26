@@ -4,7 +4,7 @@ import { useMemo, useRef, useState } from 'react';
 import {
   X, ArrowRight, ArrowLeft, ArrowDown, Database, Loader2, Download, Copy, Check,
   AlertTriangle, CheckCircle2, Play, FileCode, ShieldAlert, ShieldCheck, Info, ListOrdered,
-  Lock, Zap, Clock, Table2, Settings2, Search, GitCompare, ChevronRight, Sparkles, Eye,
+  Lock, Zap, Clock, Table2, Settings2, Search, GitCompare, ChevronRight, Sparkles, Eye, History,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Select } from '@/components/ui/select';
@@ -14,6 +14,7 @@ import { useConnections } from '@/features/connections/hooks/useConnections';
 import { engineLabel, type DatabaseEngine, type Connection } from '@/features/connections/types';
 import { EngineIcon } from './EngineIcon';
 import { SchemaDiff } from './SchemaDiff';
+import { MigrationHistory } from './MigrationHistory';
 import { useWorkspaceStore } from '@/stores/workspace.store';
 import {
   usePlanMigration,
@@ -111,6 +112,11 @@ export function MigrationWizard({ onClose }: Props) {
   const [previewTable, setPreviewTable] = useState<string | null>(null);
   const [previewData, setPreviewData] = useState<PreviewResult | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  // AI assistant (validate step)
+  const [assistQ, setAssistQ] = useState('');
+  const [assistAnswer, setAssistAnswer] = useState('');
+  const [assistLoading, setAssistLoading] = useState(false);
 
   const [scriptResult, setScriptResult] = useState<ScriptResult | null>(null);
   const [copied, setCopied] = useState(false);
@@ -232,6 +238,27 @@ export function MigrationWizard({ onClose }: Props) {
     if (colPanel === table) { setColPanel(null); return; }
     setColPanel(table);
     if (!colData[table]) void loadColumns(table);
+  };
+
+  const askAssistant = async () => {
+    const q = assistQ.trim();
+    if (!q) return;
+    setAssistLoading(true);
+    setAssistAnswer('');
+    try {
+      const ctx = validationReport
+        ? `Selected tables: ${orderedSelected.join(', ') || '(none)'}. Conflict mode: ${conflict}. ` +
+          `Validation: ${validationReport.finalRecommendation.status}; ` +
+          `${validationReport.finalRecommendation.blockers.length} blocker(s), ${validationReport.finalRecommendation.warnings.length} warning(s). ` +
+          `Top issues: ${validationReport.allIssues.slice(0, 8).map((i) => `${i.severity} ${i.code}${i.table ? ` (${i.table})` : ''}`).join('; ')}`
+        : `Selected tables: ${orderedSelected.join(', ') || '(none)'}. Conflict mode: ${conflict}.`;
+      const r = await migrationsApi.assist(currentWorkspace?.id ?? '', { question: q, context: ctx });
+      setAssistAnswer(r.answer);
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setAssistLoading(false);
+    }
   };
 
   const openPreview = async (table: string) => {
@@ -409,15 +436,23 @@ export function MigrationWizard({ onClose }: Props) {
                 </p>
               </div>
             </div>
-            <button
-              onClick={() => {
-                cancelRef.current?.();
-                onClose();
-              }}
-              className="rounded-lg p-1.5 text-muted-foreground hover:bg-accent"
-            >
-              <X className="h-4 w-4" />
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setShowHistory(true)}
+                className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-muted-foreground hover:bg-accent"
+              >
+                <History className="h-4 w-4" /> History
+              </button>
+              <button
+                onClick={() => {
+                  cancelRef.current?.();
+                  onClose();
+                }}
+                className="rounded-lg p-1.5 text-muted-foreground hover:bg-accent"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
           </div>
           <Stepper step={step} />
         </div>
@@ -817,6 +852,33 @@ export function MigrationWizard({ onClose }: Props) {
                 </p>
               )}
 
+              {/* AI assistant (#14) */}
+              <div className="rounded-xl border border-border bg-card/60 p-3">
+                <p className="mb-2 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  <Sparkles className="h-3.5 w-3.5 text-primary" /> Migration assistant
+                </p>
+                <div className="flex items-center gap-2">
+                  <input
+                    value={assistQ}
+                    onChange={(e) => setAssistQ(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') void askAssistant(); }}
+                    placeholder="Ask about this migration (e.g. why is a column flagged?)"
+                    className="flex-1 rounded-lg border border-border bg-background px-2.5 py-1.5 text-xs outline-none focus:border-primary/40"
+                  />
+                  <button
+                    onClick={() => void askAssistant()}
+                    disabled={assistLoading || !assistQ.trim()}
+                    className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                  >
+                    {assistLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                    Ask
+                  </button>
+                </div>
+                {assistAnswer && (
+                  <p className="mt-2 whitespace-pre-wrap rounded-lg bg-muted/40 p-2.5 text-xs text-foreground">{assistAnswer}</p>
+                )}
+              </div>
+
               <div className="flex items-center justify-between">
                 <button onClick={() => setStep('configure')} className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-border hover:bg-accent text-muted-foreground">
                   <ArrowLeft className="w-3.5 h-3.5" /> Back
@@ -934,6 +996,7 @@ export function MigrationWizard({ onClose }: Props) {
         onClose={() => setPreviewTable(null)}
       />
     )}
+    {showHistory && <MigrationHistory onClose={() => setShowHistory(false)} />}
     </>
   );
 }

@@ -258,6 +258,12 @@ export class OracleMigrationDriver implements MigrationDriver {
       .map((c) => `ALTER TABLE ${id(targetTable)} ADD (${id(c.name)} ${typeString(c)});`);
   }
 
+  async dropTargetTable(table: string): Promise<void> {
+    await this.tClient.query(
+      `BEGIN EXECUTE IMMEDIATE 'DROP TABLE ${id(table)} CASCADE CONSTRAINTS'; EXCEPTION WHEN OTHERS THEN NULL; END;`,
+    );
+  }
+
   async truncateTarget(table: string): Promise<void> {
     await this.tClient.query(`DELETE FROM ${id(table)}`);
   }
