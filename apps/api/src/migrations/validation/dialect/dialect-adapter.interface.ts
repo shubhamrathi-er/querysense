@@ -70,4 +70,7 @@ export interface DialectAdapter {
 
   /** Fetch up to `limit` PK tuples from this table (for the source side). */
   sampleKeys(table: string, pkCols: string[], limit: number): Promise<unknown[][]>;
+
+  /** Fetch up to `limit` full rows from this table (read-only data preview). */
+  sampleRows(table: string, limit: number): Promise<Array<Record<string, unknown>>>;
 }

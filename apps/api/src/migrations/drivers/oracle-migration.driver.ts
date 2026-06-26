@@ -2,6 +2,7 @@ import { createPool, type SqlClient, type SqlExecutor } from '../../common/db/my
 import { quoteIdent } from '../../common/db/engine';
 import {
   BATCH,
+  makeTransformApplier,
   type BaseTable,
   type Conflict,
   type CopyOptions,
@@ -223,6 +224,19 @@ export class OracleMigrationDriver implements MigrationDriver {
     }
   }
 
+  async incrementalPredicate(targetTable: string, column: string): Promise<string | null> {
+    try {
+      const rows = await this.tClient.query<Record<string, unknown>>(
+        `SELECT MAX(${id(column)}) AS "m" FROM ${id(targetTable)}`,
+      );
+      const m = rows[0]?.['m'];
+      if (m === null || m === undefined) return null;
+      return `${id(column)} > ${this.literal(m)}`;
+    } catch {
+      return null;
+    }
+  }
+
   async addColumnsToTarget(table: string, targetTable: string, columns?: string[]): Promise<string[]> {
     const want = columns ? new Set(columns) : null;
     const src = await this.columns(table);
@@ -281,6 +295,9 @@ export class OracleMigrationDriver implements MigrationDriver {
     const pkIdx = pk.map((c) => readCols.indexOf(c));
     const total = await this.sourceCount(table);
     const colList = readCols.map(id).join(', ');
+    const filter = options?.where ? `(${options.where})` : '';
+    const applyTx = makeTransformApplier(options?.transforms);
+    const toTuple = (r: Record<string, unknown>) => readCols.map((c) => applyTx(c, r[c]));
     const dedup = (conflict === 'skip' || conflict === 'upsert') && pk.length > 0 && pkIdx.every((i) => i >= 0);
 
     const copied = await this.tClient.transaction(async (tx: SqlExecutor) => {
@@ -317,12 +334,12 @@ export class OracleMigrationDriver implements MigrationDriver {
         for (;;) {
           const sql =
             last === null
-              ? `SELECT ${colList} FROM ${id(table)} ORDER BY ${id(key)} FETCH FIRST :1 ROWS ONLY`
-              : `SELECT ${colList} FROM ${id(table)} WHERE ${id(key)} > :1 ORDER BY ${id(key)} FETCH FIRST :2 ROWS ONLY`;
+              ? `SELECT ${colList} FROM ${id(table)} ${filter ? `WHERE ${filter}` : ''} ORDER BY ${id(key)} FETCH FIRST :1 ROWS ONLY`
+              : `SELECT ${colList} FROM ${id(table)} WHERE ${id(key)} > :1${filter ? ` AND ${filter}` : ''} ORDER BY ${id(key)} FETCH FIRST :2 ROWS ONLY`;
           const params = last === null ? [BATCH] : [last, BATCH];
           const rows = await this.sClient.query<Record<string, unknown>>(sql, params);
           if (rows.length === 0) break;
-          await flush(rows.map((r) => readCols.map((c) => r[c])));
+          await flush(rows.map(toTuple));
           n += rows.length;
           last = rows[rows.length - 1][key];
           onProgress(n, total);
@@ -332,11 +349,11 @@ export class OracleMigrationDriver implements MigrationDriver {
         let offset = 0;
         for (;;) {
           const rows = await this.sClient.query<Record<string, unknown>>(
-            `SELECT ${colList} FROM ${id(table)} ORDER BY ROWID OFFSET :1 ROWS FETCH NEXT :2 ROWS ONLY`,
+            `SELECT ${colList} FROM ${id(table)} ${filter ? `WHERE ${filter}` : ''} ORDER BY ROWID OFFSET :1 ROWS FETCH NEXT :2 ROWS ONLY`,
             [offset, BATCH],
           );
           if (rows.length === 0) break;
-          await flush(rows.map((r) => readCols.map((c) => r[c])));
+          await flush(rows.map(toTuple));
           n += rows.length;
           offset += rows.length;
           onProgress(n, total);
@@ -409,6 +426,8 @@ export class OracleMigrationDriver implements MigrationDriver {
     if (readCols.length === 0) return { lines, rows: 0, truncated: false };
     const readList = readCols.map(id).join(', ');
     const writeList = writeCols.map(id).join(', ');
+    const filter = options?.where ? `WHERE (${options.where})` : '';
+    const applyTx = makeTransformApplier(options?.transforms);
 
     let offset = 0;
     let rows = 0;
@@ -420,12 +439,12 @@ export class OracleMigrationDriver implements MigrationDriver {
         break;
       }
       const data = await this.sClient.query<Record<string, unknown>>(
-        `SELECT ${readList} FROM ${id(table)} ORDER BY ROWID OFFSET :1 ROWS FETCH NEXT :2 ROWS ONLY`,
+        `SELECT ${readList} FROM ${id(table)} ${filter} ORDER BY ROWID OFFSET :1 ROWS FETCH NEXT :2 ROWS ONLY`,
         [offset, BATCH],
       );
       if (data.length === 0) break;
       for (const r of data) {
-        const vals = readCols.map((c) => this.literal(r[c])).join(', ');
+        const vals = readCols.map((c) => this.literal(applyTx(c, r[c]))).join(', ');
         lines.push(`INSERT INTO ${id(targetTable)} (${writeList}) VALUES (${vals});`);
       }
       rows += data.length;

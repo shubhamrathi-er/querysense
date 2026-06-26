@@ -78,6 +78,39 @@ export class MigrationValidationService {
     }
   }
 
+  /** Read-only sample of a source table's rows + columns (data preview). */
+  async previewTable(
+    workspaceId: string,
+    connectionId: string,
+    table: string,
+    limit = 50,
+  ): Promise<{
+    columns: import('./types').ColumnSummary[];
+    rows: Array<Record<string, unknown>>;
+  }> {
+    const capped = Math.min(Math.max(Math.trunc(limit) || 50, 1), 200);
+    const a = await this.makeAdapter(connectionId, workspaceId);
+    await a.connect();
+    try {
+      const columns = await a.getColumns(table);
+      const rows = await a.sampleRows(table, capped);
+      return { columns, rows: rows.map((r) => this.sanitizeRow(r)) };
+    } finally {
+      await a.close();
+    }
+  }
+
+  /** Make a DB row JSON-safe (BigInt → string, Buffer → marker, leave the rest). */
+  private sanitizeRow(row: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(row)) {
+      if (typeof v === 'bigint') out[k] = v.toString();
+      else if (Buffer.isBuffer(v)) out[k] = `[binary ${v.length} bytes]`;
+      else out[k] = v;
+    }
+    return out;
+  }
+
   /** Quick gate used by the migration runner — true if a BLOCKER exists. */
   async hasBlockingIssues(workspaceId: string, input: ValidateInput): Promise<Issue[]> {
     const report = await this.validate(workspaceId, input);

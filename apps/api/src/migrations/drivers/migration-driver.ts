@@ -36,8 +36,75 @@ export interface ColumnMapping {
  * column not listed is ignored. When omitted, all insertable columns are copied
  * by name (the default). Future options (row filters, transforms) extend here.
  */
+/** Supported per-column value transforms (applied in JS during copy). */
+export type TransformOp =
+  | 'trim'
+  | 'upper'
+  | 'lower'
+  | 'nullify_empty'
+  | 'default'
+  | 'prefix'
+  | 'suffix';
+
+export interface ColumnTransform {
+  column: string; // source column the transform reads/writes
+  op: TransformOp;
+  value?: string; // argument for default/prefix/suffix
+}
+
+/** Apply one transform to a value. Non-string values pass through untouched
+ *  except for `default` (fills null/empty). */
+export function applyColumnTransform(t: ColumnTransform | undefined, v: unknown): unknown {
+  if (!t) return v;
+  const isEmpty = v === null || v === undefined || (typeof v === 'string' && v === '');
+  switch (t.op) {
+    case 'trim':
+      return typeof v === 'string' ? v.trim() : v;
+    case 'upper':
+      return typeof v === 'string' ? v.toUpperCase() : v;
+    case 'lower':
+      return typeof v === 'string' ? v.toLowerCase() : v;
+    case 'nullify_empty':
+      return typeof v === 'string' && v.trim() === '' ? null : v;
+    case 'default':
+      return isEmpty ? (t.value ?? v) : v;
+    case 'prefix':
+      return v === null || v === undefined ? v : `${t.value ?? ''}${v as string}`;
+    case 'suffix':
+      return v === null || v === undefined ? v : `${v as string}${t.value ?? ''}`;
+    default:
+      return v;
+  }
+}
+
+/** Build a `(column, value) => value` applier from a transform list (identity if
+ *  none). Multiple transforms on the same column are applied in order (chained). */
+export function makeTransformApplier(
+  transforms?: ColumnTransform[],
+): (col: string, v: unknown) => unknown {
+  if (!transforms || transforms.length === 0) return (_c, v) => v;
+  const byCol = new Map<string, ColumnTransform[]>();
+  for (const t of transforms) {
+    const list = byCol.get(t.column);
+    if (list) list.push(t);
+    else byCol.set(t.column, [t]);
+  }
+  return (col, v) => {
+    const list = byCol.get(col);
+    return list ? list.reduce((acc, t) => applyColumnTransform(t, acc), v) : v;
+  };
+}
+
 export interface CopyOptions {
   columns?: ColumnMapping[];
+  /**
+   * Raw SQL predicate ANDed into the source SELECT (row filter / incremental
+   * watermark). Validated by the service before it reaches a driver; inlined,
+   * so it must already be safe. Applies to the source `table`.
+   */
+  where?: string;
+  /** Per-column value transforms applied to each row during copy. */
+  transforms?: ColumnTransform[];
 }
 
 /**
@@ -74,6 +141,12 @@ export interface MigrationDriver {
   // is omitted, ALL source columns missing on the target are added.
   // Returns the columns actually added.
   addColumnsToTarget(table: string, targetTable: string, columns?: string[]): Promise<string[]>;
+
+  // ── incremental copy ──
+  // Build a WHERE predicate selecting source rows newer than the target's
+  // current MAX(column). Reads the target; returns null when the target table
+  // is empty or absent (→ copy everything). `column` must be a valid identifier.
+  incrementalPredicate(targetTable: string, column: string): Promise<string | null>;
 
   // ── copy one table's data; returns rows copied ──
   copyTable(

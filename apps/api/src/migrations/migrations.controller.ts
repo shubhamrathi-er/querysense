@@ -15,6 +15,7 @@ import {
   MigrationRunDto,
   ValidateMigrationDto,
   SuggestColumnsDto,
+  PreviewTableDto,
 } from './dto/migration.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { WorkspaceMemberGuard } from '../workspaces/guards/workspace-member.guard';
@@ -50,6 +51,20 @@ export class MigrationsController {
       tables: dto.tables,
       tableMappings: dto.tableMappings,
     });
+  }
+
+  @Post('preview')
+  @ApiOperation({ summary: 'Preview sample rows from a source table (read-only)' })
+  preview(
+    @Param('workspaceId') workspaceId: string,
+    @Body() dto: PreviewTableDto,
+  ) {
+    return this.validationService.previewTable(
+      workspaceId,
+      dto.sourceConnectionId,
+      dto.table,
+      dto.limit ?? 50,
+    );
   }
 
   @Post('suggest-columns')
@@ -90,6 +105,9 @@ export class MigrationsController {
       columnMappings: dto.columnMappings,
       addColumns: dto.addColumns,
       createMissingColumns: dto.createMissingColumns ?? true,
+      rowFilters: dto.rowFilters,
+      incremental: dto.incremental,
+      transforms: dto.transforms,
     });
   }
 
@@ -113,6 +131,9 @@ export class MigrationsController {
         columnMappings: dto.columnMappings,
         addColumns: dto.addColumns,
         createMissingColumns: dto.createMissingColumns ?? true,
+        rowFilters: dto.rowFilters,
+        incremental: dto.incremental,
+        transforms: dto.transforms,
       },
       res,
     );

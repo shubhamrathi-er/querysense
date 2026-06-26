@@ -2,6 +2,7 @@ import { createPool, type SqlClient, type SqlExecutor } from '../../common/db/my
 import { quoteIdent } from '../../common/db/engine';
 import {
   BATCH,
+  makeTransformApplier,
   type BaseTable,
   type Conflict,
   type CopyOptions,
@@ -224,6 +225,19 @@ export class SqlServerMigrationDriver implements MigrationDriver {
     }
   }
 
+  async incrementalPredicate(targetTable: string, column: string): Promise<string | null> {
+    try {
+      const rows = await this.tClient.query<Record<string, unknown>>(
+        `SELECT MAX(${id(column)}) AS m FROM ${tbl(targetTable)}`,
+      );
+      const m = rows[0]?.['m'];
+      if (m === null || m === undefined) return null;
+      return `${id(column)} > ${this.literal(m)}`;
+    } catch {
+      return null;
+    }
+  }
+
   async addColumnsToTarget(table: string, targetTable: string, columns?: string[]): Promise<string[]> {
     const want = columns ? new Set(columns) : null;
     const src = await this.columns(table);
@@ -300,6 +314,9 @@ export class SqlServerMigrationDriver implements MigrationDriver {
     const pk = await this.primaryKey(table);
     const total = await this.sourceCount(table);
     const colList = readCols.map(id).join(', ');
+    const filter = options?.where ? `(${options.where})` : '';
+    const applyTx = makeTransformApplier(options?.transforms);
+    const toTuple = (r: Record<string, unknown>) => readCols.map((c) => applyTx(c, r[c]));
     // Respect the 1000-row / 2100-param statement limits.
     const perStmt = Math.max(1, Math.min(1000, Math.floor(2100 / Math.max(1, writeCols.length))));
 
@@ -324,12 +341,12 @@ export class SqlServerMigrationDriver implements MigrationDriver {
         for (;;) {
           const sql =
             last === null
-              ? `SELECT TOP (@p0) ${colList} FROM ${tbl(table)} ORDER BY ${id(key)} ASC`
-              : `SELECT TOP (@p1) ${colList} FROM ${tbl(table)} WHERE ${id(key)} > @p0 ORDER BY ${id(key)} ASC`;
+              ? `SELECT TOP (@p0) ${colList} FROM ${tbl(table)} ${filter ? `WHERE ${filter}` : ''} ORDER BY ${id(key)} ASC`
+              : `SELECT TOP (@p1) ${colList} FROM ${tbl(table)} WHERE ${id(key)} > @p0${filter ? ` AND ${filter}` : ''} ORDER BY ${id(key)} ASC`;
           const params = last === null ? [BATCH] : [last, BATCH];
           const rows = await this.sClient.query<Record<string, unknown>>(sql, params);
           if (rows.length === 0) break;
-          await flush(rows.map((r) => readCols.map((c) => r[c])));
+          await flush(rows.map(toTuple));
           n += rows.length;
           last = rows[rows.length - 1][key];
           onProgress(n, total);
@@ -339,11 +356,11 @@ export class SqlServerMigrationDriver implements MigrationDriver {
         let offset = 0;
         for (;;) {
           const rows = await this.sClient.query<Record<string, unknown>>(
-            `SELECT ${colList} FROM ${tbl(table)} ORDER BY (SELECT NULL) OFFSET @p0 ROWS FETCH NEXT @p1 ROWS ONLY`,
+            `SELECT ${colList} FROM ${tbl(table)} ${filter ? `WHERE ${filter}` : ''} ORDER BY (SELECT NULL) OFFSET @p0 ROWS FETCH NEXT @p1 ROWS ONLY`,
             [offset, BATCH],
           );
           if (rows.length === 0) break;
-          await flush(rows.map((r) => readCols.map((c) => r[c])));
+          await flush(rows.map(toTuple));
           n += rows.length;
           offset += rows.length;
           onProgress(n, total);
@@ -417,6 +434,8 @@ export class SqlServerMigrationDriver implements MigrationDriver {
     if (readCols.length === 0) return { lines, rows: 0, truncated: false };
     const readList = readCols.map(id).join(', ');
     const writeList = writeCols.map(id).join(', ');
+    const filter = options?.where ? `WHERE (${options.where})` : '';
+    const applyTx = makeTransformApplier(options?.transforms);
     if (hasIdentity) lines.push(`SET IDENTITY_INSERT ${tbl(targetTable)} ON;`);
 
     let offset = 0;
@@ -429,12 +448,12 @@ export class SqlServerMigrationDriver implements MigrationDriver {
         break;
       }
       const data = await this.sClient.query<Record<string, unknown>>(
-        `SELECT ${readList} FROM ${tbl(table)} ORDER BY (SELECT NULL) OFFSET @p0 ROWS FETCH NEXT @p1 ROWS ONLY`,
+        `SELECT ${readList} FROM ${tbl(table)} ${filter} ORDER BY (SELECT NULL) OFFSET @p0 ROWS FETCH NEXT @p1 ROWS ONLY`,
         [offset, BATCH],
       );
       if (data.length === 0) break;
       const tuples = data
-        .map((r) => `(${readCols.map((c) => this.literal(r[c])).join(', ')})`)
+        .map((r) => `(${readCols.map((c) => this.literal(applyTx(c, r[c]))).join(', ')})`)
         .join(',\n  ');
       lines.push(`INSERT INTO ${tbl(targetTable)} (${writeList}) VALUES\n  ${tuples};`);
       rows += data.length;

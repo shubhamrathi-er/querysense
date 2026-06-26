@@ -31,6 +31,30 @@ export interface TableAddColumns {
   columns: string[];
 }
 
+export interface RowFilter {
+  table: string;
+  where: string;
+}
+
+export interface Incremental {
+  table: string;
+  column: string;
+}
+
+export type TransformOp =
+  | 'trim'
+  | 'upper'
+  | 'lower'
+  | 'nullify_empty'
+  | 'default'
+  | 'prefix'
+  | 'suffix';
+
+export interface TableTransforms {
+  table: string;
+  columns: Array<{ column: string; op: TransformOp; value?: string }>;
+}
+
 export interface ColumnInfo {
   name: string;
   type: string;
@@ -41,6 +65,11 @@ export interface SuggestColumnsResult {
   target: ColumnInfo[];
   mapping: Array<{ source: string; target: string | null }>;
   aiUsed: boolean;
+}
+
+export interface PreviewResult {
+  columns: Array<{ name: string; columnType?: string; dataType?: string }>;
+  rows: Array<Record<string, unknown>>;
 }
 
 export interface RunPayload {
@@ -54,6 +83,9 @@ export interface RunPayload {
   tableMappings?: TableMapping[];
   columnMappings?: TableColumnMapping[];
   addColumns?: TableAddColumns[];
+  rowFilters?: RowFilter[];
+  incremental?: Incremental[];
+  transforms?: TableTransforms[];
 }
 
 export const migrationsApi = {
@@ -66,6 +98,17 @@ export const migrationsApi = {
       sourceConnectionId,
       targetConnectionId,
     })) as ApiResponse<MigrationPlan>;
+    return res.data;
+  },
+
+  preview: async (
+    workspaceId: string,
+    payload: { sourceConnectionId: string; table: string; limit?: number },
+  ): Promise<PreviewResult> => {
+    const res = (await apiClient.post(
+      `/workspaces/${workspaceId}/migrations/preview`,
+      payload,
+    )) as ApiResponse<PreviewResult>;
     return res.data;
   },
 

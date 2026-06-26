@@ -3,6 +3,7 @@ import { createPostgresPool } from '../../common/db/mysql-pool';
 import { quoteIdent } from '../../common/db/engine';
 import {
   BATCH,
+  makeTransformApplier,
   type BaseTable,
   type Conflict,
   type CopyOptions,
@@ -373,6 +374,21 @@ export class PostgresMigrationDriver implements MigrationDriver {
     }
   }
 
+  async incrementalPredicate(targetTable: string, column: string): Promise<string | null> {
+    try {
+      const rows = await this.rows(
+        this.tPool,
+        `SELECT MAX(${id(column)}) AS m FROM ${id(targetTable)}`,
+        [],
+      );
+      const m = rows[0]?.['m'];
+      if (m === null || m === undefined) return null;
+      return `${id(column)} > ${this.literal(m)}`;
+    } catch {
+      return null;
+    }
+  }
+
   async copyTable(
     table: string,
     conflict: Conflict,
@@ -392,16 +408,19 @@ export class PostgresMigrationDriver implements MigrationDriver {
     const total = await this.sourceCount(table);
     const colList = readCols.map(id).join(', ');
     const conflictClause = this.conflictClause(conflict, writeCols, pk);
+    const filter = options?.where ? `(${options.where})` : '';
+    const applyTx = makeTransformApplier(options?.transforms);
+    const toTuple = (r: Record<string, unknown>) => readCols.map((c) => applyTx(c, r[c]));
 
     let copied = 0;
     if (pk.length === 1 && readCols.includes(pk[0])) {
       const key = pk[0];
       let last: unknown = null;
       for (;;) {
-        const sql =
-          last === null
-            ? `SELECT ${colList} FROM ${id(table)} ORDER BY ${id(key)} ASC LIMIT $1`
-            : `SELECT ${colList} FROM ${id(table)} WHERE ${id(key)} > $1 ORDER BY ${id(key)} ASC LIMIT $2`;
+        const conds = [...(last === null ? [] : [`${id(key)} > $1`]), ...(filter ? [filter] : [])];
+        const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+        const limitParam = last === null ? '$1' : '$2';
+        const sql = `SELECT ${colList} FROM ${id(table)} ${where} ORDER BY ${id(key)} ASC LIMIT ${limitParam}`;
         const params = last === null ? [BATCH] : [last, BATCH];
         const rows = await this.rows(this.sPool, sql, params);
         if (rows.length === 0) break;
@@ -410,7 +429,7 @@ export class PostgresMigrationDriver implements MigrationDriver {
           writeCols,
           overriding,
           conflictClause,
-          rows.map((r) => readCols.map((c) => r[c])),
+          rows.map(toTuple),
         );
         copied += rows.length;
         last = rows[rows.length - 1][key];
@@ -423,7 +442,7 @@ export class PostgresMigrationDriver implements MigrationDriver {
       for (;;) {
         const rows = await this.rows(
           this.sPool,
-          `SELECT ${colList} FROM ${id(table)} ORDER BY ctid LIMIT $1 OFFSET $2`,
+          `SELECT ${colList} FROM ${id(table)} ${filter ? `WHERE ${filter}` : ''} ORDER BY ctid LIMIT $1 OFFSET $2`,
           [BATCH, offset],
         );
         if (rows.length === 0) break;
@@ -432,7 +451,7 @@ export class PostgresMigrationDriver implements MigrationDriver {
           writeCols,
           overriding,
           conflictClause,
-          rows.map((r) => readCols.map((c) => r[c])),
+          rows.map(toTuple),
         );
         copied += rows.length;
         offset += rows.length;
@@ -504,6 +523,8 @@ export class PostgresMigrationDriver implements MigrationDriver {
     const prefix =
       `INSERT INTO ${id(targetTable)} (${writeList}) ` +
       `${overriding ? 'OVERRIDING SYSTEM VALUE ' : ''}VALUES `;
+    const filter = options?.where ? `WHERE (${options.where})` : '';
+    const applyTx = makeTransformApplier(options?.transforms);
 
     let offset = 0;
     let rows = 0;
@@ -518,12 +539,12 @@ export class PostgresMigrationDriver implements MigrationDriver {
       }
       const data = await this.rows(
         this.sPool,
-        `SELECT ${readList} FROM ${id(table)} ORDER BY ctid LIMIT $1 OFFSET $2`,
+        `SELECT ${readList} FROM ${id(table)} ${filter} ORDER BY ctid LIMIT $1 OFFSET $2`,
         [BATCH, offset],
       );
       if (data.length === 0) break;
       const tuples = data
-        .map((r) => `(${readCols.map((c) => this.literal(r[c])).join(', ')})`)
+        .map((r) => `(${readCols.map((c) => this.literal(applyTx(c, r[c]))).join(', ')})`)
         .join(',\n  ');
       lines.push(`${prefix}\n  ${tuples}${conflictClause};`);
       rows += data.length;

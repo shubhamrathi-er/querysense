@@ -4,6 +4,7 @@ import { createMysqlPool } from '../../common/db/mysql-pool';
 import { quoteIdent } from '../../common/db/engine';
 import {
   BATCH,
+  makeTransformApplier,
   type BaseTable,
   type Conflict,
   type CopyOptions,
@@ -213,6 +214,27 @@ export class MysqlMigrationDriver implements MigrationDriver {
     await this.tConn.query(`TRUNCATE TABLE ${id(table)}`);
   }
 
+  /** Render a scalar as a MySQL literal for an inlined WHERE predicate. */
+  private literalValue(v: unknown): string {
+    if (v === null || v === undefined) return 'NULL';
+    if (typeof v === 'number' || typeof v === 'bigint') return String(v);
+    if (v instanceof Date) return `'${v.toISOString().slice(0, 19).replace('T', ' ')}'`;
+    return `'${String(v).replace(/'/g, "''")}'`;
+  }
+
+  async incrementalPredicate(targetTable: string, column: string): Promise<string | null> {
+    try {
+      const [rows] = await this.tConn.query<mysql.RowDataPacket[]>(
+        `SELECT MAX(${id(column)}) AS m FROM ${id(targetTable)}`,
+      );
+      const m = (rows[0] as Record<string, unknown>)?.['m'];
+      if (m === null || m === undefined) return null;
+      return `${id(column)} > ${this.literalValue(m)}`;
+    } catch {
+      return null;
+    }
+  }
+
   /** mysql2 returns JSON columns as JS objects; re-serialize so the bulk-insert
    *  formatter doesn't expand them into extra SQL columns. */
   private normalizeValue(v: unknown): unknown {
@@ -250,21 +272,24 @@ export class MysqlMigrationDriver implements MigrationDriver {
     const total = await this.sourceCount(table);
     const colList = readCols.map(id).join(', ');
     const insertSql = this.insertTemplate(conflict, targetTable, writeCols);
+    const applyTx = makeTransformApplier(options?.transforms);
 
     const insertBatch = async (rows: mysql.RowDataPacket[]) => {
       const values = rows.map((r) =>
-        readCols.map((c) => this.normalizeValue((r as Record<string, unknown>)[c])),
+        readCols.map((c) => this.normalizeValue(applyTx(c, (r as Record<string, unknown>)[c]))),
       );
       await this.tConn.query(insertSql, [values]);
     };
 
+    const filter = options?.where ? `(${options.where})` : '';
     let copied = 0;
     // Keyset paging needs the PK in the read set; otherwise fall back to OFFSET.
     if (pk.length === 1 && readCols.includes(pk[0])) {
       const key = pk[0];
       let last: unknown = null;
       for (;;) {
-        const where = last === null ? '' : `WHERE ${id(key)} > ?`;
+        const conds = [...(last === null ? [] : [`${id(key)} > ?`]), ...(filter ? [filter] : [])];
+        const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
         const params = last === null ? [BATCH] : [last, BATCH];
         const [rows] = await this.sPool.query<mysql.RowDataPacket[]>(
           `SELECT ${colList} FROM ${id(table)} ${where} ORDER BY ${id(key)} ASC LIMIT ?`,
@@ -281,7 +306,7 @@ export class MysqlMigrationDriver implements MigrationDriver {
       let offset = 0;
       for (;;) {
         const [rows] = await this.sPool.query<mysql.RowDataPacket[]>(
-          `SELECT ${colList} FROM ${id(table)} LIMIT ? OFFSET ?`,
+          `SELECT ${colList} FROM ${id(table)} ${filter ? `WHERE ${filter}` : ''} LIMIT ? OFFSET ?`,
           [BATCH, offset],
         );
         if (rows.length === 0) break;
@@ -333,6 +358,8 @@ export class MysqlMigrationDriver implements MigrationDriver {
     if (readCols.length === 0) return { lines, rows: 0, truncated: false };
     const insertSql = this.insertTemplate(conflict, targetTable, writeCols);
     const colList = readCols.map(id).join(', ');
+    const filter = options?.where ? `WHERE (${options.where})` : '';
+    const applyTx = makeTransformApplier(options?.transforms);
 
     let offset = 0;
     let rows = 0;
@@ -346,12 +373,12 @@ export class MysqlMigrationDriver implements MigrationDriver {
         break;
       }
       const [data] = await this.sPool.query<mysql.RowDataPacket[]>(
-        `SELECT ${colList} FROM ${id(table)} LIMIT ? OFFSET ?`,
+        `SELECT ${colList} FROM ${id(table)} ${filter} LIMIT ? OFFSET ?`,
         [BATCH, offset],
       );
       if (data.length === 0) break;
       const values = data.map((r) =>
-        readCols.map((c) => this.normalizeValue((r as Record<string, unknown>)[c])),
+        readCols.map((c) => this.normalizeValue(applyTx(c, (r as Record<string, unknown>)[c]))),
       );
       lines.push(format(insertSql, [values] as never) + ';');
       rows += data.length;

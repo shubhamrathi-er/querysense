@@ -4,7 +4,7 @@ import { useMemo, useRef, useState } from 'react';
 import {
   X, ArrowRight, ArrowLeft, ArrowDown, Database, Loader2, Download, Copy, Check,
   AlertTriangle, CheckCircle2, Play, FileCode, ShieldAlert, ShieldCheck, Info, ListOrdered,
-  Lock, Zap, Clock, Table2, Settings2, Search, GitCompare, ChevronRight, Sparkles,
+  Lock, Zap, Clock, Table2, Settings2, Search, GitCompare, ChevronRight, Sparkles, Eye,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Select } from '@/components/ui/select';
@@ -20,7 +20,7 @@ import {
   useGenerateScript,
   useValidateMigration,
 } from '../hooks/useMigration';
-import { migrationsApi, type RunPayload, type ColumnInfo } from '../api/migrations.api';
+import { migrationsApi, type RunPayload, type ColumnInfo, type PreviewResult, type TransformOp } from '../api/migrations.api';
 import type {
   MigrationPlan, Conflict, ScriptResult, RunReportRow, TableState,
   ValidationReport, ValidationIssue, Severity,
@@ -101,6 +101,16 @@ export function MigrationWizard({ onClose }: Props) {
   const [colData, setColData] = useState<Record<string, { source: ColumnInfo[]; target: ColumnInfo[] }>>({});
   const [colLoading, setColLoading] = useState<string | null>(null);
   const [columnMaps, setColumnMaps] = useState<Record<string, Array<{ source: string; target: string | null }>>>({});
+  // Row filter (#7), incremental column (#9), per-column transforms (#8).
+  const [rowFilters, setRowFilters] = useState<Record<string, string>>({});
+  const [incrementalCols, setIncrementalCols] = useState<Record<string, string>>({});
+  const [transforms, setTransforms] = useState<
+    Record<string, Record<string, { op: TransformOp | ''; value?: string }>>
+  >({});
+  // Data preview modal state.
+  const [previewTable, setPreviewTable] = useState<string | null>(null);
+  const [previewData, setPreviewData] = useState<PreviewResult | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
 
   const [scriptResult, setScriptResult] = useState<ScriptResult | null>(null);
   const [copied, setCopied] = useState(false);
@@ -158,6 +168,27 @@ export function MigrationWizard({ onClose }: Props) {
       })
       .filter((m) => m.columns.length > 0);
 
+  const buildRowFilters = () =>
+    orderedSelected
+      .filter((t) => rowFilters[t]?.trim())
+      .map((t) => ({ table: t, where: rowFilters[t].trim() }));
+
+  const buildIncremental = () =>
+    orderedSelected
+      .filter((t) => incrementalCols[t])
+      .map((t) => ({ table: t, column: incrementalCols[t] }));
+
+  const buildTransforms = () =>
+    orderedSelected
+      .filter((t) => transforms[t])
+      .map((t) => ({
+        table: t,
+        columns: Object.entries(transforms[t])
+          .filter(([, v]) => v.op)
+          .map(([column, v]) => ({ column, op: v.op as TransformOp, value: v.value || undefined })),
+      }))
+      .filter((m) => m.columns.length > 0);
+
   const payload = (): RunPayload => ({
     sourceConnectionId: sourceId,
     targetConnectionId: targetId,
@@ -168,6 +199,9 @@ export function MigrationWizard({ onClose }: Props) {
     tableMappings: buildMappings(),
     columnMappings: buildColumnMappings(),
     addColumns: buildAddColumns(),
+    rowFilters: buildRowFilters(),
+    incremental: buildIncremental(),
+    transforms: buildTransforms(),
   });
 
   const loadColumns = async (table: string) => {
@@ -198,6 +232,25 @@ export function MigrationWizard({ onClose }: Props) {
     if (colPanel === table) { setColPanel(null); return; }
     setColPanel(table);
     if (!colData[table]) void loadColumns(table);
+  };
+
+  const openPreview = async (table: string) => {
+    setPreviewTable(table);
+    setPreviewData(null);
+    setPreviewLoading(true);
+    try {
+      const r = await migrationsApi.preview(currentWorkspace?.id ?? '', {
+        sourceConnectionId: sourceId,
+        table,
+        limit: 50,
+      });
+      setPreviewData(r);
+    } catch (e) {
+      toast.error(errMsg(e));
+      setPreviewTable(null);
+    } finally {
+      setPreviewLoading(false);
+    }
   };
 
   const setColTarget = (table: string, source: string, target: string | null) =>
@@ -334,6 +387,7 @@ export function MigrationWizard({ onClose }: Props) {
     });
 
   return (
+    <>
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
       <div className="flex max-h-[90vh] w-full max-w-[920px] flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl">
         {/* Header */}
@@ -601,6 +655,15 @@ export function MigrationWizard({ onClose }: Props) {
                               <button type="button" onClick={() => toggle(t.tableName)} className="truncate text-left font-mono text-foreground">
                                 {t.tableName}
                               </button>
+                              <button
+                                type="button"
+                                onClick={() => void openPreview(t.tableName)}
+                                aria-label={`Preview data for ${t.tableName}`}
+                                title="Preview data"
+                                className="shrink-0 text-muted-foreground hover:text-foreground"
+                              >
+                                <Eye className="h-3.5 w-3.5" />
+                              </button>
                               {ignored > 0 && (
                                 <span className="shrink-0 rounded bg-muted px-1 text-[9px] text-muted-foreground" title={`${mapped} mapped, ${ignored} ignored`}>
                                   {mapped}/{mapped + ignored} cols
@@ -637,6 +700,17 @@ export function MigrationWizard({ onClose }: Props) {
                               loading={colLoading === t.tableName}
                               onSuggest={() => void loadColumns(t.tableName)}
                               onSet={(src, tgt) => setColTarget(t.tableName, src, tgt)}
+                              rowFilter={rowFilters[t.tableName] ?? ''}
+                              onRowFilter={(v) => setRowFilters((m) => ({ ...m, [t.tableName]: v }))}
+                              incrementalCol={incrementalCols[t.tableName] ?? ''}
+                              onIncremental={(v) => setIncrementalCols((m) => ({ ...m, [t.tableName]: v }))}
+                              transforms={transforms[t.tableName] ?? {}}
+                              onTransform={(col, op, value) =>
+                                setTransforms((m) => ({
+                                  ...m,
+                                  [t.tableName]: { ...(m[t.tableName] ?? {}), [col]: { op, value } },
+                                }))
+                              }
                             />
                           )}
                         </div>
@@ -852,6 +926,15 @@ export function MigrationWizard({ onClose }: Props) {
         </div>
       </div>
     </div>
+    {previewTable && (
+      <PreviewModal
+        table={previewTable}
+        data={previewData}
+        loading={previewLoading}
+        onClose={() => setPreviewTable(null)}
+      />
+    )}
+    </>
   );
 }
 
@@ -977,8 +1060,92 @@ function FilterTab({ active, onClick, children }: { active: boolean; onClick: ()
   );
 }
 
+function PreviewModal({
+  table,
+  data,
+  loading,
+  onClose,
+}: {
+  table: string;
+  data: PreviewResult | null;
+  loading: boolean;
+  onClose: () => void;
+}) {
+  const cell = (v: unknown): string => {
+    if (v === null || v === undefined) return '∅';
+    if (typeof v === 'object') return JSON.stringify(v);
+    return String(v);
+  };
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="flex max-h-[80vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-border bg-background shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-border px-4 py-3">
+          <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+            <Eye className="h-4 w-4 text-primary" />
+            Preview · <span className="font-mono">{table}</span>
+            {data && <span className="text-xs font-normal text-muted-foreground">first {data.rows.length} rows</span>}
+          </div>
+          <button onClick={onClose} className="rounded-lg p-1 text-muted-foreground hover:bg-accent" aria-label="Close preview">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto">
+          {loading ? (
+            <div className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" /> Loading sample…
+            </div>
+          ) : !data ? null : data.rows.length === 0 ? (
+            <p className="py-12 text-center text-sm text-muted-foreground">This table is empty.</p>
+          ) : (
+            <table className="w-full border-collapse text-xs">
+              <thead className="sticky top-0 bg-muted/40 backdrop-blur">
+                <tr>
+                  {data.columns.map((c) => (
+                    <th key={c.name} className="whitespace-nowrap border-b border-border px-3 py-2 text-left font-medium text-foreground">
+                      {c.name}
+                      <span className="ml-1 font-normal text-muted-foreground">{c.columnType ?? c.dataType}</span>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {data.rows.map((row, i) => (
+                  <tr key={i} className="even:bg-muted/20">
+                    {data.columns.map((c) => (
+                      <td key={c.name} className="max-w-[20rem] truncate border-b border-border/40 px-3 py-1.5 font-mono text-muted-foreground" title={cell(row[c.name])}>
+                        {cell(row[c.name])}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const IGNORE = '__ignore__';
 const CREATE = '__create__';
+
+const TRANSFORM_OPS: Array<{ value: TransformOp | ''; label: string; needsValue?: boolean }> = [
+  { value: '', label: 'No transform' },
+  { value: 'trim', label: 'Trim' },
+  { value: 'upper', label: 'UPPERCASE' },
+  { value: 'lower', label: 'lowercase' },
+  { value: 'nullify_empty', label: 'Empty → NULL' },
+  { value: 'default', label: 'Default if empty…', needsValue: true },
+  { value: 'prefix', label: 'Add prefix…', needsValue: true },
+  { value: 'suffix', label: 'Add suffix…', needsValue: true },
+];
 
 function ColumnMapPanel({
   data,
@@ -986,6 +1153,12 @@ function ColumnMapPanel({
   loading,
   onSuggest,
   onSet,
+  rowFilter,
+  onRowFilter,
+  incrementalCol,
+  onIncremental,
+  transforms,
+  onTransform,
 }: {
   table: string;
   data?: { source: ColumnInfo[]; target: ColumnInfo[] };
@@ -993,15 +1166,48 @@ function ColumnMapPanel({
   loading: boolean;
   onSuggest: () => void;
   onSet: (source: string, target: string | null) => void;
+  rowFilter: string;
+  onRowFilter: (v: string) => void;
+  incrementalCol: string;
+  onIncremental: (v: string) => void;
+  transforms: Record<string, { op: TransformOp | ''; value?: string }>;
+  onTransform: (col: string, op: TransformOp | '', value?: string) => void;
 }) {
   const targetOf = (col: string) => map?.find((m) => m.source === col)?.target ?? null;
   const existing = new Set((data?.target ?? []).map((c) => c.name));
 
   return (
-    <div className="border-t border-border/40 bg-muted/20 px-3 py-3">
-      <div className="mb-2 flex items-center justify-between">
+    <div className="space-y-3 border-t border-border/40 bg-muted/20 px-3 py-3">
+      {/* Row filter (#7) + incremental (#9) */}
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <label className="space-y-1">
+          <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Row filter (WHERE)</span>
+          <input
+            value={rowFilter}
+            onChange={(e) => onRowFilter(e.target.value)}
+            placeholder="e.g. status = 'active' AND total > 0"
+            spellCheck={false}
+            className="w-full rounded border border-border bg-background px-1.5 py-1 font-mono text-[11px] outline-none focus:border-primary/40"
+          />
+        </label>
+        <label className="space-y-1">
+          <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Incremental column</span>
+          <select
+            value={incrementalCol}
+            onChange={(e) => onIncremental(e.target.value)}
+            className="w-full rounded border border-border bg-background px-1.5 py-1 font-mono text-[11px] outline-none focus:border-primary/40"
+          >
+            <option value="">— Full copy —</option>
+            {(data?.source ?? []).map((sc) => (
+              <option key={sc.name} value={sc.name}>{sc.name}</option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      <div className="flex items-center justify-between">
         <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-          Column mapping {data && <span className="font-normal normal-case">· map, ignore, or create on target</span>}
+          Column mapping {data && <span className="font-normal normal-case">· map · ignore · create · transform</span>}
         </span>
         <button
           type="button"
@@ -1026,11 +1232,15 @@ function ColumnMapPanel({
         <div className="space-y-1">
           {data.source.map((sc) => {
             const tgt = targetOf(sc.name);
-            // tgt set but not an existing target column ⇒ it will be created.
             const willCreate = !!tgt && !existing.has(tgt);
             const selectValue = tgt == null ? IGNORE : willCreate ? CREATE : tgt;
+            const tx = transforms[sc.name] ?? { op: '' as const };
+            const needsValue = TRANSFORM_OPS.find((o) => o.value === tx.op)?.needsValue;
             return (
-              <div key={sc.name} className="grid grid-cols-[minmax(0,1fr)_1rem_minmax(0,1fr)] items-center gap-2 text-xs">
+              <div
+                key={sc.name}
+                className="grid grid-cols-[minmax(0,1.1fr)_1rem_minmax(0,1.1fr)_minmax(0,1fr)] items-center gap-2 text-xs"
+              >
                 <span className="flex min-w-0 items-center gap-1.5">
                   <span className="truncate font-mono text-foreground">{sc.name}</span>
                   <code className="shrink-0 rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">{sc.type}</code>
@@ -1059,6 +1269,26 @@ function ColumnMapPanel({
                   ))}
                   <option value={CREATE}>➕ Create “{sc.name}” on target</option>
                 </select>
+                <div className="flex items-center gap-1">
+                  <select
+                    value={tx.op}
+                    onChange={(e) => onTransform(sc.name, e.target.value as TransformOp | '', tx.value)}
+                    aria-label={`Transform for ${sc.name}`}
+                    className="min-w-0 flex-1 rounded border border-border bg-background px-1.5 py-1 text-[11px] outline-none focus:border-primary/40"
+                  >
+                    {TRANSFORM_OPS.map((o) => (
+                      <option key={o.value} value={o.value}>{o.label}</option>
+                    ))}
+                  </select>
+                  {needsValue && (
+                    <input
+                      value={tx.value ?? ''}
+                      onChange={(e) => onTransform(sc.name, tx.op, e.target.value)}
+                      placeholder="value"
+                      className="w-16 shrink-0 rounded border border-border bg-background px-1.5 py-1 font-mono text-[11px] outline-none focus:border-primary/40"
+                    />
+                  )}
+                </div>
               </div>
             );
           })}

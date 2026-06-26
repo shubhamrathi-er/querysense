@@ -332,6 +332,10 @@ export class MysqlAdapter implements DialectAdapter {
     return rows.map((r) => pkCols.map((c) => r[c]));
   }
 
+  async sampleRows(table: string, limit: number): Promise<Array<Record<string, unknown>>> {
+    return this.q(`SELECT * FROM ${id(table)} LIMIT ?`, [limit]);
+  }
+
   async probeDuplicates(
     table: string,
     pkCols: string[],

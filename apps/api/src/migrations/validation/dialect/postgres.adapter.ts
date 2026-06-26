@@ -385,6 +385,12 @@ export class PostgresAdapter implements DialectAdapter {
     return rows.map((r) => pkCols.map((c) => r[c]));
   }
 
+  async sampleRows(table: string, limit: number): Promise<Array<Record<string, unknown>>> {
+    return this.q(`SELECT * FROM ${id(table)} LIMIT $1`, [limit]) as Promise<
+      Array<Record<string, unknown>>
+    >;
+  }
+
   async probeDuplicates(
     table: string,
     pkCols: string[],

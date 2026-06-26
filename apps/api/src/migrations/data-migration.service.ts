@@ -16,6 +16,7 @@ import {
   createMigrationDriver,
   SCRIPT_ROW_CAP,
   type Conflict,
+  type ColumnTransform,
   type MigrationConn,
   type MigrationDriver,
 } from './drivers';
@@ -159,8 +160,12 @@ export class DataMigrationService {
       columnMappings?: Array<{ table: string; columns: Array<{ source: string; target: string }> }>;
       addColumns?: Array<{ table: string; columns: string[] }>;
       createMissingColumns?: boolean;
+      rowFilters?: Array<{ table: string; where: string }>;
+      incremental?: Array<{ table: string; column: string }>;
+      transforms?: Array<{ table: string; columns: ColumnTransform[] }>;
     },
   ): Promise<{ sql: string; truncated: boolean; rowsIncluded: number }> {
+    for (const f of dto.rowFilters ?? []) this.assertSafeFilter(f.where);
     const source = await this.load(dto.sourceConnectionId, workspaceId);
     const target = await this.load(dto.targetConnectionId, workspaceId);
     const engine = this.assertSameEngine(source, target);
@@ -171,11 +176,12 @@ export class DataMigrationService {
     );
     await driver.openSource();
 
-    // Emitting ALTER ... ADD COLUMN needs to introspect the live target to know
-    // what's missing — only open it when the script will actually need it.
+    // Some script steps must introspect the live target — adding missing columns
+    // and computing an incremental watermark — so open it only when needed.
     const needTarget =
-      !dto.createTables &&
-      (dto.createMissingColumns !== false || (dto.addColumns?.length ?? 0) > 0);
+      (!dto.createTables &&
+        (dto.createMissingColumns !== false || (dto.addColumns?.length ?? 0) > 0)) ||
+      (dto.incremental?.length ?? 0) > 0;
     if (needTarget) await driver.openTarget();
 
     try {
@@ -183,6 +189,9 @@ export class DataMigrationService {
       const targetOf = this.targetMapper(dto.tableMappings);
       const colMapOf = this.columnMapper(dto.columnMappings);
       const addColsOf = this.addColumnsMapper(dto.addColumns);
+      const rowFilterOf = this.rowFilterMapper(dto.rowFilters);
+      const incrementalOf = this.incrementalMapper(dto.incremental);
+      const txOf = this.transformsMapper(dto.transforms);
       const parts: string[] = driver.scriptHeader(source.name, source.databaseName);
       let rowsIncluded = 0;
       let truncated = false;
@@ -206,7 +215,14 @@ export class DataMigrationService {
         if (dto.conflict === 'truncate') {
           parts.push(driver.scriptTruncate(target));
         }
-        const ins = await driver.scriptInserts(table, dto.conflict, SCRIPT_ROW_CAP, target, { columns: colMapOf(table) });
+        const where = needTarget
+          ? await this.combineWhere(driver, target, rowFilterOf(table), incrementalOf(table))
+          : rowFilterOf(table); // incremental needs the target; row filter doesn't
+        const ins = await driver.scriptInserts(table, dto.conflict, SCRIPT_ROW_CAP, target, {
+          columns: colMapOf(table),
+          where,
+          transforms: txOf(table),
+        });
         parts.push(...ins.lines);
         rowsIncluded += ins.rows;
         truncated = truncated || ins.truncated;
@@ -234,6 +250,9 @@ export class DataMigrationService {
       columnMappings?: Array<{ table: string; columns: Array<{ source: string; target: string }> }>;
       addColumns?: Array<{ table: string; columns: string[] }>;
       createMissingColumns?: boolean;
+      rowFilters?: Array<{ table: string; where: string }>;
+      incremental?: Array<{ table: string; column: string }>;
+      transforms?: Array<{ table: string; columns: ColumnTransform[] }>;
     },
     res: Response,
   ): Promise<void> {
@@ -243,6 +262,16 @@ export class DataMigrationService {
     res.flushHeaders();
     const send = (event: string, data: unknown) =>
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+    // Reject unsafe row filters before doing any work.
+    const badFilter = (dto.rowFilters ?? []).find((f) => !this.isSafeFilter(f.where));
+    if (badFilter) {
+      send('error', {
+        message: `Invalid row filter for "${badFilter.table}" — use a single boolean expression (no ";" or SQL comments).`,
+      });
+      res.end();
+      return;
+    }
 
     // Pre-flight validation gate: never start if a BLOCKER is present.
     if (!dto.skipValidation) {
@@ -298,6 +327,9 @@ export class DataMigrationService {
       const targetOf = this.targetMapper(dto.tableMappings);
       const colMapOf = this.columnMapper(dto.columnMappings);
       const addColsOf = this.addColumnsMapper(dto.addColumns);
+      const rowFilterOf = this.rowFilterMapper(dto.rowFilters);
+      const incrementalOf = this.incrementalMapper(dto.incremental);
+      const txOf = this.transformsMapper(dto.transforms);
       const targetExisting = new Set(
         (await driver.targetBaseTables()).map((t) => t.name),
       );
@@ -332,12 +364,18 @@ export class DataMigrationService {
             await driver.truncateTarget(target);
           }
 
+          const where = await this.combineWhere(
+            driver,
+            target,
+            rowFilterOf(table),
+            incrementalOf(table),
+          );
           const copied = await driver.copyTable(
             table,
             dto.conflict,
             (n, total) => send('progress', { table, copied: n, total }),
             target,
-            { columns: colMapOf(table) },
+            { columns: colMapOf(table), where, transforms: txOf(table) },
           );
 
           const sourceRows = await driver.sourceCount(table);
@@ -393,6 +431,72 @@ export class DataMigrationService {
       const cols = map.get(table);
       return cols && cols.length > 0 ? cols : undefined;
     };
+  }
+
+  /** Resolve a source table's row-filter WHERE fragment (validated). */
+  private rowFilterMapper(
+    filters?: Array<{ table: string; where: string }>,
+  ): (table: string) => string | undefined {
+    const map = new Map((filters ?? []).map((f) => [f.table, f.where]));
+    return (table: string) => {
+      const w = map.get(table)?.trim();
+      if (!w) return undefined;
+      this.assertSafeFilter(w);
+      return w;
+    };
+  }
+
+  /** Resolve a source table's per-column transforms. */
+  private transformsMapper(
+    transforms?: Array<{
+      table: string;
+      columns: Array<{ column: string; op: ColumnTransform['op']; value?: string }>;
+    }>,
+  ): (table: string) => ColumnTransform[] | undefined {
+    const map = new Map((transforms ?? []).map((t) => [t.table, t.columns]));
+    return (table: string) => {
+      const cols = map.get(table);
+      return cols && cols.length > 0 ? cols : undefined;
+    };
+  }
+
+  /** Resolve a source table's incremental watermark column. */
+  private incrementalMapper(
+    incremental?: Array<{ table: string; column: string }>,
+  ): (table: string) => string | undefined {
+    const map = new Map((incremental ?? []).map((i) => [i.table, i.column]));
+    return (table: string) => map.get(table) || undefined;
+  }
+
+  /** A user WHERE fragment is safe if it's a single expression (no stacking/comments). */
+  private isSafeFilter(where: string): boolean {
+    return where.trim().length > 0 && where.length <= 2000 && !/;|--|\/\*|\*\//.test(where);
+  }
+
+  /** Guard a user-supplied WHERE fragment: no statement-stacking or comments. */
+  private assertSafeFilter(where: string): void {
+    if (!this.isSafeFilter(where)) {
+      throw new BadRequestException(
+        'Row filter must be a single boolean expression (no ";" or SQL comments).',
+      );
+    }
+  }
+
+  /** Combine a row filter and an incremental predicate into one WHERE fragment. */
+  private async combineWhere(
+    driver: MigrationDriver,
+    targetTable: string,
+    rowFilter: string | undefined,
+    incrementalColumn: string | undefined,
+  ): Promise<string | undefined> {
+    const parts: string[] = [];
+    if (rowFilter) parts.push(`(${rowFilter})`);
+    if (incrementalColumn) {
+      this.assertIdent(incrementalColumn);
+      const pred = await driver.incrementalPredicate(targetTable, incrementalColumn);
+      if (pred) parts.push(`(${pred})`);
+    }
+    return parts.length ? parts.join(' AND ') : undefined;
   }
 
   private async orderTables(
